@@ -334,6 +334,9 @@ class CheckResult:
     timestamp: Optional[datetime] = None
     excerpt: str = ""
     details: str = ""
+    #: Header printed above ``excerpt``. Checks may override to describe what the excerpt
+    #: shows (e.g. "Latest excerpt (last 5 requests):").
+    excerpt_label: str = "Latest excerpt:"
 
 
 # Convenience constructors so check bodies stay terse.
@@ -352,9 +355,10 @@ def issue(
     details: str,
     timestamp: Optional[datetime] = None,
     excerpt: str = "",
+    excerpt_label: str = "Latest excerpt:",
 ) -> CheckResult:
     return CheckResult(number, title, Status.ISSUE, timestamp=timestamp,
-                       excerpt=excerpt, details=details)
+                       excerpt=excerpt, details=details, excerpt_label=excerpt_label)
 
 
 def errored(number: str, title: str, exc: BaseException) -> CheckResult:
@@ -643,42 +647,68 @@ def check_2a(ctx: Context) -> CheckResult:
     return issue("2a", title, details=details, timestamp=events[e][0], excerpt=excerpt)
 
 
-@register("2b", "Brute force via web logs")
+#: First dotted-quad in a log line. The client IP is the first IP-looking token in both
+#: Apache layouts we see (combined puts it first; this bundle's access_log puts it after a
+#: leading "[timestamp]" field) -- a date never contains a dotted quad, so the first match
+#: is the client even when the timestamp precedes it. Positional split() would mis-read the
+#: timestamp-first layout.
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _client_ip(line: str) -> Optional[str]:
+    m = _IPV4_RE.search(line)
+    return m.group(0) if m else None
+
+
+@register("2b", "Brute Force Attack - web server access_log")
 def check_2b(ctx: Context) -> CheckResult:
-    """Flag source IPs exceeding WEB_PER_MINUTE_THRESHOLD requests per minute in access_log."""
-    title = "Brute force via web logs"
+    """Flag minute-windows where one source IP made >= WEB_PER_MINUTE_THRESHOLD requests."""
+    title = "Brute Force Attack - web server access_log"
     if not ctx.reader.present("access_log"):
         return skipped("2b", title)
-    per_ip_minute: dict = defaultdict(Counter)  # ip -> Counter(minute_key)
-    per_ip_total: Counter = Counter()
-    per_ip_latest: dict = {}  # ip -> (ts, line)
+    windows: dict = defaultdict(list)  # (ip, minute_key) -> raw lines, oldest -> newest
+    window_ts: dict = {}               # (ip, minute_key) -> latest UTC ts in that minute
     for line in ctx.reader.read_lines("access_log"):
         if not line.strip():
             continue
-        ip = line.split()[0]
+        ip = _client_ip(line)
         ts = parse_timestamp(line)
-        minute_key = ts.strftime("%Y-%m-%d %H:%M") if ts else None
-        if minute_key is not None:
-            per_ip_minute[ip][minute_key] += 1
-        per_ip_total[ip] += 1
-        if ts is not None and (ip not in per_ip_latest or ts >= per_ip_latest[ip][0]):
-            per_ip_latest[ip] = (ts, line.strip())
-    offenders = []  # (ip, peak_per_minute, total)
-    for ip, minutes in per_ip_minute.items():
-        peak = max(minutes.values(), default=0)
-        if peak > WEB_PER_MINUTE_THRESHOLD:
-            offenders.append((ip, peak, per_ip_total[ip]))
+        if ip is None or ts is None:
+            continue
+        key = (ip, ts.strftime("%Y-%m-%d %H:%M"))
+        windows[key].append(line.strip())
+        window_ts[key] = ts  # last write wins -> newest ts within the minute
+    offenders = [(key, lines) for key, lines in windows.items()
+                 if len(lines) >= WEB_PER_MINUTE_THRESHOLD]
     if not offenders:
         return ok("2b", title)
-    offenders.sort(key=lambda o: o[1], reverse=True)
-    details = (f"{len(offenders)} source IP(s) exceeded {WEB_PER_MINUTE_THRESHOLD} "
-               f"req/min: "
-               + "; ".join(f"{ip} peak={peak}/min total={total}"
-                           for ip, peak, total in offenders[:10]))
-    latest = per_ip_latest.get(offenders[0][0])
-    return issue("2b", title, details=details,
-                 timestamp=latest[0] if latest else None,
-                 excerpt=latest[1] if latest else "")
+    # Headline the most recent offending window, by timestamp.
+    (ip, _minute), lines = max(offenders, key=lambda kv: window_ts[kv[0]])
+    count = len(lines)
+    disp_minute = _apache_minute(lines[-1]) or to_display(window_ts[(ip, _minute)])
+    details = (f"{len(offenders)} minute-window(s) with >= {WEB_PER_MINUTE_THRESHOLD} "
+               f"requests from a single IP detected.\n\n"
+               f"Most recent: IP {ip} at {disp_minute} with {count} requests "
+               f"in that minute.")
+    excerpt = "\n".join(f"(access_log) {l}" for l in lines[-5:])
+    return issue("2b", title, details=details, timestamp=None, excerpt=excerpt,
+                 excerpt_label="Latest excerpt (last 5 requests):")
+
+
+def _apache_minute(line: str) -> Optional[str]:
+    """Minute label in the log's own local time (e.g. '11/Apr/2026:18:03'), or None.
+
+    Uses the raw Apache stamp -- not the UTC-normalized datetime -- so the displayed
+    minute matches the offset shown in the excerpt rather than being shifted to UTC.
+    """
+    m = _RE_APACHE.search(line)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group("stamp"), _APACHE_FMT)
+    except ValueError:
+        return None
+    return dt.strftime("%d/%b/%Y:%H:%M")
 
 
 _REBOOT_RE = re.compile(
@@ -1200,29 +1230,43 @@ def info_5(ctx: Context) -> CheckResult:
 # (4) Reporter.
 # ---------------------------------------------------------------------------
 
-_RULE = "-" * 78
 _BANNER = "=" * 78
 
+# Status banners for the plain-text block header. ISSUE/ERRORED shout; OK/SKIPPED don't.
+_STATUS_BANNER = {
+    Status.OK: "OK",
+    Status.SKIPPED: "SKIPPED",
+    Status.ISSUE: "*** ISSUE FOUND ***",
+    Status.ERRORED: "*** ERRORED ***",
+}
 
-def _render_block(r: CheckResult) -> list[str]:
-    lines = [_RULE, f"Check {r.number} - {r.title}", f"  Result    : {r.status}"]
+
+def _status_banner(status: str) -> str:
+    return _STATUS_BANNER.get(status, status)
+
+
+def _render_block(r: CheckResult, idx: int) -> list[str]:
+    lines = [f"--- [{idx}] {r.number}) {r.title} ---",
+             f"STATUS: {_status_banner(r.status)}"]
     if r.details:
-        detail_lines = r.details.splitlines() or [""]
-        lines.append(f"  Details   : {detail_lines[0]}")
-        lines.extend(f"              {extra}" for extra in detail_lines[1:])
-    if r.status == Status.ISSUE:
-        lines.append(f"  Timestamp : {to_display(r.timestamp)}")
+        lines.extend(r.details.splitlines() or [""])
+    # Checks that fold the time into their details (e.g. 2b) leave timestamp unset; only
+    # show a standalone time line when an issue still carries one.
+    if r.status == Status.ISSUE and r.timestamp is not None:
+        lines.append(f"Latest event: {to_display(r.timestamp)}")
     # Render any non-empty excerpt, including the multi-line Info blocks (HA, sizing,
     # top recurring lines), not just ISSUE excerpts.
     if r.excerpt:
-        lines.append("  Log excerpt:")
-        lines.extend(f"    {ln}" for ln in r.excerpt.splitlines() or [""])
+        lines.append(r.excerpt_label)
+        lines.extend(f"  {ln}" for ln in r.excerpt.splitlines() or [""])
     return lines
 
 
 def render_report(results: list[tuple[Check, CheckResult]]) -> str:
     """Render all results into the two-banner plain-text report (spec Section 4)."""
     out: list[str] = []
+    # Global 1-based render index across the full order (1->[1], 2a->[2], 2b->[3], ...).
+    idx_of = {id(res): i for i, (_chk, res) in enumerate(results, start=1)}
 
     def section(num: int, banner: str):
         out.append(_BANNER)
@@ -1231,11 +1275,12 @@ def render_report(results: list[tuple[Check, CheckResult]]) -> str:
         any_block = False
         for chk, res in results:
             if chk.section == num:
-                out.extend(_render_block(res))
+                out.extend(_render_block(res, idx_of[id(res)]))
+                out.append("")
                 any_block = True
         if not any_block:
             out.append("  (no checks)")
-        out.append("")
+            out.append("")
 
     section(1, "SECTION 1 - ISSUES FOUND")
     section(2, "SECTION 2 - GENERAL INFORMATION")
