@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import email.utils
 import glob
+import html
 import os
 import re
 import socket
@@ -1242,15 +1243,218 @@ def render_report(results: list[tuple[Check, CheckResult]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# (7) HTML reporter -- the "hacker interface". Same CheckResult data as the text
+# reporter, rendered as one self-contained page (inline CSS + JS, no external
+# assets, stdlib only -- safe for an air-gapped box).
+# ---------------------------------------------------------------------------
+
+# Map each status to a CSS class so colors are driven by per-theme variables.
+_STATUS_CLASS = {
+    Status.OK: "ok",
+    Status.SKIPPED: "skipped",
+    Status.ISSUE: "issue",
+    Status.ERRORED: "errored",
+}
+
+
+def _status_class(status: str) -> str:
+    return _STATUS_CLASS.get(status, "skipped")
+
+
+def _esc(text: str) -> str:
+    """Escape untrusted text (log excerpts/details come from arbitrary bundle files)."""
+    return html.escape(text or "", quote=True)
+
+
+def _html_block(r: CheckResult) -> str:
+    """Render one check as a status-classed card, mirroring ``_render_block``."""
+    cls = _status_class(r.status)
+    parts = [f'<article class="card card--{cls}" data-status="{r.status}">']
+    parts.append('  <header class="card__head">')
+    parts.append(f'    <span class="card__num">{_esc(r.number)}</span>')
+    parts.append(f'    <span class="card__title">{_esc(r.title)}</span>')
+    parts.append(f'    <span class="badge badge--{cls}">{_esc(r.status)}</span>')
+    parts.append('  </header>')
+    if r.details:
+        parts.append(f'  <div class="card__details">{_esc(r.details)}</div>')
+    if r.status == Status.ISSUE:
+        parts.append(f'  <div class="card__meta">timestamp: {_esc(to_display(r.timestamp))}</div>')
+    if r.excerpt:
+        parts.append(f'  <pre class="card__excerpt">{_esc(r.excerpt)}</pre>')
+    parts.append('</article>')
+    return "\n".join(parts)
+
+
+# Inline stylesheet. Themes are switched by the ``data-theme`` attribute on <html>;
+# each theme just rebinds the CSS custom properties.
+_HTML_STYLE = """\
+:root, html[data-theme="terminal"] {
+  --bg:#020a02; --bg2:#0a160a; --fg:#39ff64; --dim:#1f7a35; --line:#114d20;
+  --glow:0 0 6px rgba(57,255,100,.55); --accent:#39ff64;
+  --ok:#39ff64; --skipped:#5a7a5a; --issue:#ff5b5b; --errored:#ffb347;
+}
+html[data-theme="amber"] {
+  --bg:#0d0700; --bg2:#1a1000; --fg:#ffb000; --dim:#8a5e00; --line:#5a3d00;
+  --glow:0 0 6px rgba(255,176,0,.55); --accent:#ffd060;
+  --ok:#ffd060; --skipped:#8a6a2a; --issue:#ff6a3d; --errored:#ffe08a;
+}
+html[data-theme="neon"] {
+  --bg:#070512; --bg2:#100a26; --fg:#00f0ff; --dim:#5a4b8a; --line:#3a2a66;
+  --glow:0 0 8px rgba(0,240,255,.6); --accent:#ff3df0;
+  --ok:#00ff9c; --skipped:#6a6a8a; --issue:#ff3df0; --errored:#ffd23d;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; padding:0 0 4rem; background:var(--bg); color:var(--fg);
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  font-size:14px; line-height:1.5; text-shadow:var(--glow);
+}
+/* CRT scanline overlay */
+body::before {
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:9999;
+  background:repeating-linear-gradient(rgba(0,0,0,0) 0 2px, rgba(0,0,0,.18) 2px 4px);
+  mix-blend-mode:multiply;
+}
+.wrap { max-width:1000px; margin:0 auto; padding:1.5rem; }
+header.top { border:1px solid var(--line); background:var(--bg2); padding:1rem 1.25rem; margin-bottom:1.25rem; }
+.brand { font-size:2rem; font-weight:bold; letter-spacing:.15em; color:var(--accent); }
+.brand .cursor { animation:blink 1s step-end infinite; }
+@keyframes blink { 50% { opacity:0; } }
+.subtitle { color:var(--dim); margin-top:.25rem; word-break:break-all; }
+.controls { margin-top:.9rem; display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; }
+.controls .label { color:var(--dim); margin-right:.25rem; }
+button.btn {
+  background:transparent; color:var(--fg); border:1px solid var(--line);
+  font:inherit; text-shadow:var(--glow); padding:.25rem .6rem; cursor:pointer;
+}
+button.btn:hover { border-color:var(--accent); color:var(--accent); }
+button.btn.active { border-color:var(--accent); color:var(--bg); background:var(--accent); text-shadow:none; }
+.tiles { display:flex; flex-wrap:wrap; gap:.75rem; margin-bottom:1.25rem; }
+.tile { flex:1 1 8rem; border:1px solid var(--line); background:var(--bg2); padding:.75rem 1rem; }
+.tile .n { font-size:1.8rem; font-weight:bold; }
+.tile .k { color:var(--dim); text-transform:uppercase; letter-spacing:.1em; font-size:.8rem; }
+.tile--ok .n{color:var(--ok);} .tile--skipped .n{color:var(--skipped);}
+.tile--issue .n{color:var(--issue);} .tile--errored .n{color:var(--errored);}
+h2.section { border-bottom:1px solid var(--line); color:var(--accent); letter-spacing:.1em; margin:1.5rem 0 .75rem; padding-bottom:.3rem; }
+.card { border:1px solid var(--line); border-left-width:4px; background:var(--bg2); padding:.75rem 1rem; margin-bottom:.6rem; }
+.card--ok{border-left-color:var(--ok);} .card--skipped{border-left-color:var(--skipped);}
+.card--issue{border-left-color:var(--issue);} .card--errored{border-left-color:var(--errored);}
+.card__head { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+.card__num { color:var(--dim); }
+.card__title { font-weight:bold; flex:1 1 auto; }
+.badge { font-size:.75rem; padding:.1rem .5rem; border:1px solid currentColor; letter-spacing:.08em; }
+.badge--ok{color:var(--ok);} .badge--skipped{color:var(--skipped);}
+.badge--issue{color:var(--issue);} .badge--errored{color:var(--errored);}
+.card__details { margin-top:.5rem; white-space:pre-wrap; }
+.card__meta { margin-top:.35rem; color:var(--dim); }
+.card__excerpt { margin:.5rem 0 0; padding:.6rem; background:var(--bg); border:1px solid var(--line);
+  color:var(--dim); overflow-x:auto; white-space:pre; }
+/* status filtering: hiding a status adds a body class */
+body.hide-OK .card[data-status="OK"],
+body.hide-SKIPPED .card[data-status="SKIPPED"],
+body.hide-ISSUE .card[data-status="ISSUE"],
+body.hide-ERRORED .card[data-status="ERRORED"] { display:none; }
+"""
+
+# Inline script: theme switching (persisted) + status-filter toggles. No dependencies.
+_HTML_SCRIPT = """\
+(function () {
+  var root = document.documentElement, body = document.body;
+  function setTheme(t) {
+    root.setAttribute("data-theme", t);
+    try { localStorage.setItem("faclog-theme", t); } catch (e) {}
+    document.querySelectorAll("button[data-theme]").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-theme") === t);
+    });
+  }
+  var saved = null;
+  try { saved = localStorage.getItem("faclog-theme"); } catch (e) {}
+  setTheme(saved || "terminal");
+  document.querySelectorAll("button[data-theme]").forEach(function (b) {
+    b.addEventListener("click", function () { setTheme(b.getAttribute("data-theme")); });
+  });
+  document.querySelectorAll("button[data-filter]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var cls = "hide-" + b.getAttribute("data-filter");
+      var hidden = body.classList.toggle(cls);
+      b.classList.toggle("active", !hidden);
+    });
+  });
+})();
+"""
+
+
+def render_report_html(results: list[tuple[Check, CheckResult]], bundle_dir: str) -> str:
+    """Render all results as one self-contained HTML page (the "hacker interface")."""
+    counts = Counter(res.status for _, res in results)
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    tiles = "\n".join(
+        f'<div class="tile tile--{_status_class(st)}"><div class="n">{counts.get(st, 0)}</div>'
+        f'<div class="k">{st.lower()}</div></div>'
+        for st in (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
+    )
+
+    filter_btns = "\n".join(
+        f'<button class="btn active" data-filter="{st}">{st}</button>'
+        for st in (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
+    )
+
+    def section_html(num: int, banner: str) -> str:
+        blocks = [_html_block(res) for chk, res in results if chk.section == num]
+        body = "\n".join(blocks) if blocks else '<p class="card__meta">(no checks)</p>'
+        return f'<h2 class="section">{_esc(banner)}</h2>\n{body}'
+
+    return f"""<!DOCTYPE html>
+<html lang="en" data-theme="terminal">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>faclog report</title>
+<style>
+{_HTML_STYLE}</style>
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+  <div class="brand">faclog<span class="cursor">_</span></div>
+  <div class="subtitle">FortiAuthenticator log analysis &middot; bundle: {_esc(bundle_dir)} &middot; generated {_esc(generated)}</div>
+  <div class="controls">
+    <span class="label">theme:</span>
+    <button class="btn" data-theme="terminal">terminal</button>
+    <button class="btn" data-theme="amber">amber</button>
+    <button class="btn" data-theme="neon">neon</button>
+    <span class="label" style="margin-left:1rem;">filter:</span>
+    {filter_btns}
+  </div>
+</header>
+<div class="tiles">
+{tiles}
+</div>
+{section_html(1, "SECTION 1 - ISSUES FOUND")}
+{section_html(2, "SECTION 2 - GENERAL INFORMATION")}
+</div>
+<script>
+{_HTML_SCRIPT}</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Orchestration + CLI.
 # ---------------------------------------------------------------------------
 
 
-def analyze(bundle_dir: str, check_network: bool = False) -> str:
-    """Run every registered check against ``bundle_dir`` and render the report."""
+def run_all(bundle_dir: str, check_network: bool = False) -> list[tuple[Check, CheckResult]]:
+    """Run every registered check against ``bundle_dir`` and return structured results."""
     ctx = Context(reader=BundleReader(bundle_dir), check_network=check_network)
-    results = [(chk, run_check(chk, ctx)) for chk in REGISTRY]
-    return render_report(results)
+    return [(chk, run_check(chk, ctx)) for chk in REGISTRY]
+
+
+def analyze(bundle_dir: str, check_network: bool = False) -> str:
+    """Run every registered check against ``bundle_dir`` and render the text report."""
+    return render_report(run_all(bundle_dir, check_network=check_network))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1267,6 +1471,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable live reachability probing for Check 6 (default: off).",
     )
     parser.add_argument(
+        "--html", action="store_true", default=False,
+        help="Render the report as a self-contained HTML page (also inferred from a "
+             ".html/.htm output path).",
+    )
+    parser.add_argument(
         "-o", "--output", default=None,
         help="Write the report to this path (default: stdout).",
     )
@@ -1278,7 +1487,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not os.path.isdir(args.bundle_dir):
         sys.stderr.write(f"error: not a directory: {args.bundle_dir}\n")
         return 2
-    report = analyze(args.bundle_dir, check_network=args.check_network)
+    as_html = args.html or (
+        args.output is not None and args.output.lower().endswith((".html", ".htm"))
+    )
+    if as_html:
+        report = render_report_html(
+            run_all(args.bundle_dir, check_network=args.check_network),
+            args.bundle_dir,
+        )
+    else:
+        report = analyze(args.bundle_dir, check_network=args.check_network)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(report + "\n")

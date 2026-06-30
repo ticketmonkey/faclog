@@ -16,7 +16,7 @@ off unless you explicitly ask for it.
 ## Usage
 
 ```
-python3 faclog.py [bundle_dir] [-o OUTPUT] [--check-network]
+python3 faclog.py [bundle_dir] [-o OUTPUT] [--check-network] [--html]
 ```
 
 | Argument / flag | Meaning |
@@ -24,6 +24,7 @@ python3 faclog.py [bundle_dir] [-o OUTPUT] [--check-network]
 | `bundle_dir` | Directory holding the diagnostic bundle. Optional; defaults to the current directory (`.`). |
 | `-o`, `--output PATH` | Write the report to `PATH` instead of stdout. |
 | `--check-network` | Enable the Check 6 live reachability probe (default **off**). |
+| `--html` | Render a self-contained HTML page instead of plain text. Also inferred when `--output` ends in `.html`/`.htm`. |
 | `-h`, `--help` | Show usage and exit. |
 
 ### Examples
@@ -37,6 +38,11 @@ python3 faclog.py /path/to/bundle -o report.txt
 
 # Also run the live reachability probe (Check 6)
 python3 faclog.py /path/to/bundle --check-network
+
+# Render a self-contained HTML report (open in any browser; three switchable
+# "hacker" themes -- terminal / amber CRT / neon -- plus status filters)
+python3 faclog.py /path/to/bundle -o report.html
+python3 faclog.py /path/to/bundle --html > report.html
 ```
 
 ## Input: the bundle directory
