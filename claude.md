@@ -55,17 +55,20 @@ access), `error_log` (Apache error), `fgdfac.log` (Forti daemon, ISO8601 + HTTP 
 3. **`BundleReader`** — rotation-aware, missing-file-tolerant file access.
 4. **Check contract** — `CheckResult`, `Status`, `Check`, `Context`, `REGISTRY`,
    `register()`, `run_check()`, `Occurrences`.
-5. **Checks (Sections 5–6)** — one `@register`ed function per check/info. **Currently stubs**:
-   each returns `SKIPPED`/placeholder `OK` with a docstring describing the signature it will
-   detect. Real detection logic is the next deliverable.
+5. **Checks (Sections 5–6)** — one `@register`ed function per check/info, with detection
+   logic implemented. Shared parsing helpers (`_forti_fields`, `_forti_lines`,
+   `_kernel_lines`, `_cpu_core_count`, `_memory_gb`) sit alongside the checks; Info-3
+   sizing tables are encoded as data (`RESOURCE_TABLE_A`/`_B`).
 6. **Reporter** — `render_report()` emits the two banner sections.
 7. **CLI** — `argparse`: positional `bundle_dir`, `--check-network`, `-o/--output`.
 
 ## Status
 
-Framework (spec Sections 0–4) is built and runs end-to-end with stubbed checks. Next:
-implement the detection logic for Checks 1–11 and Info 1–5 (spec Sections 5–6), reusing the
-normalization layer, `BundleReader`, and `Occurrences`.
+Built end-to-end: framework (spec Sections 0–4) plus detection logic for all of Checks 1–11
+and Info 1–5 (spec Sections 5–6), reusing the normalization layer, `BundleReader`, and
+`Occurrences`. Two assumptions to note: the "last 30 days" window (Checks 5, Info 5) is
+relative to the most recent timestamp in the source (no reliable "now" on an air-gapped box),
+and Check 6 network probing stays off unless `--check-network` is passed.
 
 ## Run
 

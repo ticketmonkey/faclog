@@ -7,16 +7,17 @@ proxy, NTP, custom Forti daemons) and reports *latent / general* issues -- condi
 that have caused problems across deployments -- rather than diagnosing one reported
 fault.
 
-This file is the framework (spec Sections 0-4):
+This file holds both the framework and the detection checks:
 
     (0) Named thresholds          -- all tunables in one place.
     (1) Timestamp normalization   -- every component log into tz-aware UTC.
     (2) BundleReader              -- rotation-aware, missing-file-tolerant file access.
     (3) Check contract + runner   -- OK / SKIPPED / ISSUE / ERRORED, per-check isolation.
+  (5/6) Detection checks          -- one @register'ed function per check/info.
     (4) Reporter + CLI            -- two banner sections, fixed check numbering.
 
-The individual detection checks (spec Sections 5-6) are registered here as stubs so the
-framework runs end-to-end; their real logic lands in later work.
+The detection checks (spec Sections 5-6) implement Checks 1-11 and Info 1-5, reusing the
+normalization layer, BundleReader, and the Occurrences summarizer.
 
 Standard library only -- the bundle may be analyzed on an air-gapped support box. The
 sole network use is Check 6, gated behind ``--check-network`` (default off), and it too
@@ -30,10 +31,12 @@ import email.utils
 import glob
 import os
 import re
+import socket
 import sys
 import traceback
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,40 @@ NETWORK_TIMEOUT_SECONDS = 5
 
 #: Firmware version boundary that selects the resource-sizing table (Info 3).
 FW_TABLE_BOUNDARY = (8, 0)
+
+#: Check 1 -- max gap between the chap/mschap/double-space failures of one triple.
+CHAP_TRIPLE_WINDOW_SECONDS = 5
+
+#: Check 5 -- number of longest LDAP outages to list.
+LDAP_TOP_OUTAGES = 10
+
+#: Info 5 -- number of most-frequent normalized log lines to show.
+INFO_TOP_RECURRING = 10
+
+# Info 3 -- resource sizing tables, encoded as data (not inline conditionals).
+# Each row: (max_users_upper_bound, required_cpus, required_ram_gb, required_disk_tb).
+# Rows are ordered ascending; a licensed "Max users" count maps to the first row whose
+# upper bound is >= the count. The final row's bound is the largest supported tier.
+RESOURCE_TABLE_A = [  # FW < 8.0
+    (500, 1, 4, 1),
+    (2500, 2, 4, 1),
+    (7500, 2, 8, 2),
+    (25000, 4, 16, 2),
+    (75000, 8, 32, 4),
+    (250000, 16, 64, 4),
+    (750000, 32, 128, 8),
+    (2500000, 64, 256, 16),
+    (7500000, 64, 512, 16),
+]
+RESOURCE_TABLE_B = [  # FW >= 8.0
+    (2500, 8, 16, 1),
+    (25000, 8, 16, 2),
+    (75000, 8, 32, 4),
+    (250000, 16, 64, 4),
+    (750000, 32, 128, 8),
+    (2500000, 64, 256, 16),
+    (7500000, 64, 512, 16),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -413,64 +450,400 @@ class Occurrences:
 
 
 # ---------------------------------------------------------------------------
-# (5/6) Registered checks -- STUBS.
+# (5/6) Registered checks -- detection logic for spec Sections 5-6.
 #
-# Each check is a real registry entry with a docstring linking to the signature it will
-# detect, but the body currently only reports SKIPPED (source absent) or a placeholder
-# OK. Real detection logic lands in later deliverables. Numbering is authoritative here.
+# One @register'ed function per check/info, each reusing the normalization layer,
+# BundleReader, and Occurrences. run_check() isolates exceptions, so the bodies parse
+# optimistically. Numbering is authoritative here (fixed render order).
 # ---------------------------------------------------------------------------
 
 _FORTI_EVENT = ("gui-db.log", "fac.logs")
 
+# Forti key=value field extractor. Values are bare or double-quoted; quoted values may
+# contain spaces (e.g. user="john doe", msg="authentication ...").
+_FORTI_KV = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
 
-def _stub(ctx: Context, number: str, title: str, *files: str) -> CheckResult:
-    """Shared stub body: SKIPPED if no source file present, else placeholder OK."""
-    if files and not ctx.reader.present(*files):
-        return skipped(number, title)
-    return ok(number, title, details="not yet implemented")
+# A timestamp-bearing minimum used to sort "unknown time" (None) entries to the front.
+_TS_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _ts_sort_key(ts: Optional[datetime]):
+    """Sort key putting unparseable (None) timestamps before real ones."""
+    return (ts is not None, ts or _TS_MIN)
+
+
+def _forti_fields(line: str) -> dict:
+    """Parse a Forti key=value line into a dict. Quoted values keep their spaces."""
+    fields: dict = {}
+    for m in _FORTI_KV.finditer(line):
+        fields[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return fields
+
+
+def _forti_lines(reader: BundleReader) -> list[str]:
+    """Forti event-log lines. Prefer fac.logs (a superset of gui-db.log) to avoid
+    double-counting events that appear in both."""
+    if reader.present("fac.logs"):
+        return reader.read_lines("fac.logs")
+    return reader.read_lines("gui-db.log")
+
+
+def _kernel_lines(reader: BundleReader) -> list[str]:
+    """Combined kernel + syslog lines (distinct sources), oldest -> newest."""
+    return reader.read_lines("kern.log") + reader.read_lines("syslog")
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Human-readable HhMmSs duration."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m{s}s"
+    if m:
+        return f"{m}m{s}s"
+    return f"{s}s"
+
+
+def _probe_reachable(host: str, port: int) -> bool:
+    """True if a TCP connection to host:port succeeds within NETWORK_TIMEOUT_SECONDS.
+    Never raises -- any error means 'not reachable' (Check 6)."""
+    try:
+        with socket.create_connection((host, port), timeout=NETWORK_TIMEOUT_SECONDS):
+            return True
+    except Exception:  # noqa: BLE001 -- a probe must never abort the run
+        return False
+
+
+def _cpu_core_count(reader: BundleReader) -> Optional[int]:
+    """Core count = max CPU id + 1, read from the 'CPU' column of the top block in
+    curproc. Returns None if the block/column is not found (Info 1, reused by Info 3)."""
+    in_top = False
+    cpu_idx: Optional[int] = None
+    max_cpu = -1
+    for line in reader.read_lines("curproc"):
+        if "Current Processes (by CPU usage)" in line:
+            in_top, cpu_idx = True, None
+            continue
+        if not in_top:
+            continue
+        cols = line.split()
+        if cpu_idx is None:
+            if "CPU" in cols:
+                cpu_idx = cols.index("CPU")
+            continue
+        if len(cols) > cpu_idx and cols[cpu_idx].isdigit():
+            max_cpu = max(max_cpu, int(cols[cpu_idx]))
+    return max_cpu + 1 if max_cpu >= 0 else None
+
+
+def _memory_gb(reader: BundleReader) -> dict:
+    """Total / free / available RAM in GB from meminfo (Info 2, reused by Info 3)."""
+    keymap = {"MemTotal": "total", "MemFree": "free", "MemAvailable": "available"}
+    vals: dict = {}
+    for line in reader.read_lines("meminfo"):
+        m = re.match(r"(\w+):\s+(\d+)\s*kB", line)
+        if m and m.group(1) in keymap:
+            vals[keymap[m.group(1)]] = int(m.group(2)) / (1024 * 1024)  # kB -> GB
+    return vals
 
 
 @register("1", "Incorrect configuration (chap/mschap triple auth)")
 def check_1(ctx: Context) -> CheckResult:
     """Detect one user failing chap + mschap + 'authentication  ' (double-space) auth
     three times at ~1s intervals -- the misconfigured-token signature."""
-    return _stub(ctx, "1", "Incorrect configuration (chap/mschap triple auth)", *_FORTI_EVENT)
+    title = "Incorrect configuration (chap/mschap triple auth)"
+    if not ctx.reader.present(*_FORTI_EVENT):
+        return skipped("1", title)
+    # Per-user events, classified by which of the three msg variants the raw line shows.
+    # The double-space "authentication  " form is the literal signature (an empty auth
+    # method leaves two spaces); match it on the raw line since an unquoted msg value
+    # would be truncated at the first space.
+    per_user: dict = defaultdict(list)  # user -> [(ts, variant, line)]
+    for line in _forti_lines(ctx.reader):
+        if "authentication" not in line:
+            continue
+        if "authentication(chap)" in line:
+            variant = "chap"
+        elif "authentication(mschap)" in line:
+            variant = "mschap"
+        elif "authentication  " in line:
+            variant = "blank"
+        else:
+            continue
+        user = _forti_fields(line).get("user")
+        if not user:
+            continue
+        per_user[user].append((parse_timestamp(line), variant, line.strip()))
+
+    window = timedelta(seconds=CHAP_TRIPLE_WINDOW_SECONDS)
+    affected: dict = {}  # user -> (latest_ts, excerpt)
+    for user, evs in per_user.items():
+        timed = sorted((e for e in evs if e[0] is not None), key=lambda e: e[0])
+        for i in range(len(timed)):
+            chosen: dict = {}
+            for ts, variant, line in timed[i:]:
+                if ts - timed[i][0] > window:
+                    break
+                chosen.setdefault(variant, (ts, line))
+            if {"chap", "mschap", "blank"} <= set(chosen):
+                latest = max(chosen.values(), key=lambda v: v[0])
+                excerpt = "\n".join(chosen[v][1] for v in ("chap", "mschap", "blank"))
+                affected[user] = (latest[0], excerpt)
+    if not affected:
+        return ok("1", title)
+    latest_user = max(affected, key=lambda u: affected[u][0])
+    ts, excerpt = affected[latest_user]
+    users = ", ".join(sorted(affected))
+    return issue("1", title,
+                 details=f"{len(affected)} user(s) hit the chap/mschap/double-space "
+                         f"triple within {CHAP_TRIPLE_WINDOW_SECONDS}s: {users}",
+                 timestamp=ts, excerpt=excerpt)
 
 
 @register("2a", "Brute force via auth logs")
 def check_2a(ctx: Context) -> CheckResult:
     """Flag many 'invalid user' failures within AUTH_WINDOW_SECONDS."""
-    return _stub(ctx, "2a", "Brute force via auth logs", *_FORTI_EVENT)
+    title = "Brute force via auth logs"
+    if not ctx.reader.present(*_FORTI_EVENT):
+        return skipped("2a", title)
+    events = []  # (ts, user, line)
+    for line in _forti_lines(ctx.reader):
+        if "invalid user" not in line.lower():
+            continue
+        ts = parse_timestamp(line)
+        if ts is None:
+            continue
+        user = _forti_fields(line).get("user") or "(unknown)"
+        events.append((ts, user, line.strip()))
+    if len(events) < AUTH_INVALID_USER_THRESHOLD:
+        return ok("2a", title)
+    events.sort(key=lambda e: e[0])
+    window = timedelta(seconds=AUTH_WINDOW_SECONDS)
+    # Two-pointer sliding window over sorted timestamps to find the densest burst.
+    start = 0
+    best_count, best_span = 0, (0, 0)
+    for end in range(len(events)):
+        while events[end][0] - events[start][0] > window:
+            start += 1
+        if end - start + 1 > best_count:
+            best_count = end - start + 1
+            best_span = (start, end)
+    if best_count < AUTH_INVALID_USER_THRESHOLD:
+        return ok("2a", title)
+    s, e = best_span
+    burst = events[s:e + 1]
+    sample = sorted({u for _, u, _ in burst})[:10]
+    details = (f"{best_count} 'invalid user' failures within {AUTH_WINDOW_SECONDS}s "
+               f"(threshold {AUTH_INVALID_USER_THRESHOLD}); window "
+               f"{to_display(events[s][0])} -> {to_display(events[e][0])}; "
+               f"users tried: {', '.join(sample)}")
+    excerpt = "\n".join(l for _, _, l in burst[-3:])
+    return issue("2a", title, details=details, timestamp=events[e][0], excerpt=excerpt)
 
 
 @register("2b", "Brute force via web logs")
 def check_2b(ctx: Context) -> CheckResult:
     """Flag source IPs exceeding WEB_PER_MINUTE_THRESHOLD requests per minute in access_log."""
-    return _stub(ctx, "2b", "Brute force via web logs", "access_log")
+    title = "Brute force via web logs"
+    if not ctx.reader.present("access_log"):
+        return skipped("2b", title)
+    per_ip_minute: dict = defaultdict(Counter)  # ip -> Counter(minute_key)
+    per_ip_total: Counter = Counter()
+    per_ip_latest: dict = {}  # ip -> (ts, line)
+    for line in ctx.reader.read_lines("access_log"):
+        if not line.strip():
+            continue
+        ip = line.split()[0]
+        ts = parse_timestamp(line)
+        minute_key = ts.strftime("%Y-%m-%d %H:%M") if ts else None
+        if minute_key is not None:
+            per_ip_minute[ip][minute_key] += 1
+        per_ip_total[ip] += 1
+        if ts is not None and (ip not in per_ip_latest or ts >= per_ip_latest[ip][0]):
+            per_ip_latest[ip] = (ts, line.strip())
+    offenders = []  # (ip, peak_per_minute, total)
+    for ip, minutes in per_ip_minute.items():
+        peak = max(minutes.values(), default=0)
+        if peak > WEB_PER_MINUTE_THRESHOLD:
+            offenders.append((ip, peak, per_ip_total[ip]))
+    if not offenders:
+        return ok("2b", title)
+    offenders.sort(key=lambda o: o[1], reverse=True)
+    details = (f"{len(offenders)} source IP(s) exceeded {WEB_PER_MINUTE_THRESHOLD} "
+               f"req/min: "
+               + "; ".join(f"{ip} peak={peak}/min total={total}"
+                           for ip, peak, total in offenders[:10]))
+    latest = per_ip_latest.get(offenders[0][0])
+    return issue("2b", title, details=details,
+                 timestamp=latest[0] if latest else None,
+                 excerpt=latest[1] if latest else "")
+
+
+_REBOOT_RE = re.compile(
+    r"recovered from an (?:unintended|unusual) (?:shutdown|reboot)"
+    r"|\b(?:unintended|unusual)\b[^\n]*\breboot\b",
+    re.I,
+)
 
 
 @register("3", "Unintended reboot")
 def check_3(ctx: Context) -> CheckResult:
     """Detect 'recovered from an unintended/unusual shutdown/reboot' power-cycle messages."""
-    return _stub(ctx, "3", "Unintended reboot", *_FORTI_EVENT)
+    title = "Unintended reboot"
+    if not ctx.reader.present(*_FORTI_EVENT):
+        return skipped("3", title)
+    occ = Occurrences(keep=1)
+    for line in _forti_lines(ctx.reader):
+        if _REBOOT_RE.search(line):
+            occ.add(parse_timestamp(line), line.strip())
+    if occ.count == 0:
+        return ok("3", title)
+    return issue("3", title,
+                 details=f"{occ.count} unintended/unusual reboot message(s)",
+                 timestamp=occ.latest_timestamp, excerpt=occ.latest_excerpt)
+
+
+_NTPD_RE = re.compile(r"NTPD adjusted time from (?P<a>.+?) to (?P<b>.+)", re.I)
 
 
 @register("4a", "NTP instability")
 def check_4a(ctx: Context) -> CheckResult:
     """Detect NTPD time adjustments that oscillate forward then back."""
-    return _stub(ctx, "4a", "NTP instability", *_FORTI_EVENT)
+    title = "NTP instability"
+    if not ctx.reader.present(*_FORTI_EVENT):
+        return skipped("4a", title)
+    adjustments = []  # (event_ts, direction, line)
+    for line in _forti_lines(ctx.reader):
+        m = _NTPD_RE.search(line)
+        if not m:
+            continue
+        a, b = parse_timestamp(m.group("a")), parse_timestamp(m.group("b"))
+        if a is None or b is None:
+            continue
+        delta = (b - a).total_seconds()
+        direction = (delta > 0) - (delta < 0)  # +1 forward, -1 back, 0 no change
+        if direction != 0:
+            adjustments.append((parse_timestamp(line), direction, line.strip()))
+    # Oscillation = a direction change between consecutive (signed) adjustments.
+    osc = []  # (event_ts, prev_line, line)
+    prev_dir, prev_line = 0, None
+    for ev_ts, direction, line in adjustments:
+        if prev_dir != 0 and direction != prev_dir:
+            osc.append((ev_ts, prev_line, line))
+        prev_dir, prev_line = direction, line
+    if not osc:
+        return ok("4a", title)
+    latest = max(osc, key=lambda o: _ts_sort_key(o[0]))
+    return issue("4a", title,
+                 details=f"{len(osc)} NTPD forward/back oscillation(s) detected",
+                 timestamp=latest[0], excerpt=f"{latest[1]}\n{latest[2]}")
 
 
 @register("4b", "System clock drift vs HTTP server time")
 def check_4b(ctx: Context) -> CheckResult:
     """Compare local log time against the HTTP Date: header; flag deltas > CLOCK_DRIFT_SECONDS."""
-    return _stub(ctx, "4b", "System clock drift vs HTTP server time", "fgdfac.log")
+    title = "System clock drift vs HTTP server time"
+    if not ctx.reader.present("fgdfac.log"):
+        return skipped("4b", title)
+    # Walk the log; remember the most recent ISO8601 log-line timestamp (the line that
+    # introduces a block). When a Date: header appears a few lines later inside that
+    # block, both normalize to UTC -- a delta > threshold means the appliance clock is off.
+    last_log_ts: Optional[datetime] = None
+    last_log_line = ""
+    occ = Occurrences(keep=1)
+    worst = None  # (abs_delta, log_ts, excerpt)
+    for line in ctx.reader.read_lines("fgdfac.log"):
+        date_hdr = _RE_HTTP_DATE.search(line)
+        if date_hdr:
+            if last_log_ts is None:
+                continue
+            http_ts = parse_timestamp(date_hdr.group(0))
+            if http_ts is None:
+                continue
+            delta = abs((http_ts - last_log_ts).total_seconds())
+            if delta > CLOCK_DRIFT_SECONDS:
+                excerpt = f"{last_log_line}\n    Date: {date_hdr.group(0)}"
+                occ.add(last_log_ts, excerpt)
+                if worst is None or delta > worst[0]:
+                    worst = (delta, last_log_ts, excerpt)
+        elif _RE_ISO.search(line):
+            ts = parse_timestamp(line)
+            if ts is not None:
+                last_log_ts, last_log_line = ts, line.strip()
+    if worst is None:
+        return ok("4b", title)
+    delta, log_ts, excerpt = worst
+    return issue("4b", title,
+                 details=f"clock drift up to {delta:.0f}s > {CLOCK_DRIFT_SECONDS}s between "
+                         f"local log time and HTTP Date header ({occ.count} occurrence(s))",
+                 timestamp=log_ts, excerpt=excerpt)
+
+
+_LDAP_RE = re.compile(
+    r"Remote server \(LDAP\) at (?P<ip>[\d.]+):(?P<port>\d+) has become "
+    r"(?P<state>unreachable|available)",
+    re.I,
+)
 
 
 @register("5", "Remote LDAP reachability")
 def check_5(ctx: Context) -> CheckResult:
     """Pair LDAP unreachable->available transitions per IP; summarize over LOOKBACK_DAYS."""
-    return _stub(ctx, "5", "Remote LDAP reachability", *_FORTI_EVENT)
+    title = "Remote LDAP reachability"
+    if not ctx.reader.present(*_FORTI_EVENT):
+        return skipped("5", title)
+    events: dict = defaultdict(list)  # ip -> [(ts, state)]
+    all_ts = []
+    for line in _forti_lines(ctx.reader):
+        m = _LDAP_RE.search(line)
+        if not m:
+            continue
+        ts = parse_timestamp(line)
+        events[m.group("ip")].append((ts, m.group("state").lower()))
+        if ts is not None:
+            all_ts.append(ts)
+    if not events:
+        return ok("5", title)
+    # "Last 30 days" is relative to the most recent event in the bundle (static,
+    # air-gapped analysis -- there is no reliable "now").
+    horizon = (max(all_ts) - timedelta(days=LOOKBACK_DAYS)) if all_ts else None
+
+    def in_window(ts: Optional[datetime]) -> bool:
+        return horizon is None or (ts is not None and ts >= horizon)
+
+    per_ip_count: dict = {}
+    outages = []  # (duration_seconds, ip, start_ts, end_ts)
+    for ip, evs in events.items():
+        windowed = [e for e in evs if in_window(e[0])]
+        per_ip_count[ip] = len(windowed)
+        timed = sorted((e for e in windowed if e[0] is not None), key=lambda e: e[0])
+        pending = None
+        for ts, state in timed:
+            if state == "unreachable":
+                pending = ts
+            elif state == "available" and pending is not None:
+                outages.append(((ts - pending).total_seconds(), ip, pending, ts))
+                pending = None
+    outages.sort(reverse=True)
+    top = outages[:LDAP_TOP_OUTAGES]
+    counts = "; ".join(f"{ip}: {c} event(s)" for ip, c in sorted(per_ip_count.items()))
+    if top:
+        outage_lines = "\n".join(
+            f"    {ip}: {_fmt_duration(dur)} ({to_display(start)} -> {to_display(end)})"
+            for dur, ip, start, end in top)
+    else:
+        outage_lines = "    (no completed unreachable->available outages in window)"
+    return issue("5", title,
+                 details=f"LDAP reachability events in last {LOOKBACK_DAYS}d -- {counts}",
+                 timestamp=max(all_ts) if all_ts else None,
+                 excerpt="Top outages:\n" + outage_lines)
+
+
+_AH01914_RE = re.compile(
+    r"AH01914: Configuring server (?P<fqdn>[\w.\-]+):(?P<port>\d+) for SSL")
+_FQDN_PORT_RE = re.compile(
+    r"\b(?P<fqdn>[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+):(?P<port>\d+)\b")
 
 
 @register("6", "Webserver URL reachability")
@@ -480,71 +853,346 @@ def check_6(ctx: Context) -> CheckResult:
     title = "Webserver URL reachability"
     if not ctx.reader.present("error_log"):
         return skipped("6", title)
+    text = ctx.reader.read_text("error_log")
+    # Prefer the Apache SSL config line; fall back to any FQDN:port in the log.
+    candidates: list = []
+    seen: set = set()
+    for regex in (_AH01914_RE, _FQDN_PORT_RE):
+        for m in regex.finditer(text):
+            key = (m.group("fqdn"), int(m.group("port")))
+            if key not in seen:
+                seen.add(key)
+                candidates.append(key)
+        if candidates:
+            break
+    if not candidates:
+        return ok("6", title, details="no FQDN:port candidates found in error_log")
+    listed = ", ".join(f"{h}:{p}" for h, p in candidates)
     if not ctx.check_network:
-        return ok("6", title, details="network probing off (--check-network); not-tested")
-    return ok("6", title, details="not yet implemented")
+        return ok("6", title,
+                  details=f"network probing off (--check-network); would test {listed}; "
+                          f"not-tested")
+    reachable = [f"{h}:{p}" for h, p in candidates if _probe_reachable(h, p)]
+    if reachable:
+        # Inverted semantics: externally reachable is the problem.
+        return issue("6", title,
+                     details=f"externally reachable (should not be): {', '.join(reachable)}",
+                     excerpt=listed)
+    return ok("6", title, details=f"probed {listed}; none reachable")
+
+
+_OOM_PROC_RE = re.compile(r"Killed process \d+ \(([^)]+)\)|task=([\w./\-]+)")
 
 
 @register("7", "Out-of-Memory events")
 def check_7(ctx: Context) -> CheckResult:
     """Find 'oom-kill' / 'Out of memory: Killed process' in kernel/syslog."""
-    return _stub(ctx, "7", "Out-of-Memory events", "kern.log", "syslog")
+    title = "Out-of-Memory events"
+    if not ctx.reader.present("kern.log", "syslog"):
+        return skipped("7", title)
+    occ = Occurrences(keep=1)
+    procs: Counter = Counter()
+    for line in _kernel_lines(ctx.reader):
+        low = line.lower()
+        if "oom-kill" not in low and "out of memory" not in low:
+            continue
+        m = _OOM_PROC_RE.search(line)
+        if m:
+            procs[m.group(1) or m.group(2)] += 1
+        occ.add(parse_timestamp(line), line.strip())
+    if occ.count == 0:
+        return ok("7", title)
+    names = (", ".join(f"{n} (x{c})" for n, c in procs.most_common(5))
+             if procs else "(process name not parsed)")
+    return issue("7", title,
+                 details=f"{occ.count} OOM event(s); killed: {names}",
+                 timestamp=occ.latest_timestamp, excerpt=occ.latest_excerpt)
+
+
+_SEGFAULT_RE = re.compile(r"(?P<proc>[\w./\-]+)\[\d+\]: segfault")
 
 
 @register("8", "Process crashes (segfault)")
 def check_8(ctx: Context) -> CheckResult:
     """Find 'segfault' lines grouped by crashing process name."""
-    return _stub(ctx, "8", "Process crashes (segfault)", "kern.log", "syslog")
+    title = "Process crashes (segfault)"
+    if not ctx.reader.present("kern.log", "syslog"):
+        return skipped("8", title)
+    counts: Counter = Counter()
+    per_proc: dict = defaultdict(lambda: Occurrences(keep=1))
+    for line in _kernel_lines(ctx.reader):
+        if "segfault" not in line:
+            continue
+        m = _SEGFAULT_RE.search(line)
+        proc = m.group("proc").rsplit("/", 1)[-1] if m else "(unknown)"
+        counts[proc] += 1
+        per_proc[proc].add(parse_timestamp(line), line.strip())
+    if not counts:
+        return ok("8", title)
+    summary = ", ".join(f"{p} (x{c})" for p, c in counts.most_common())
+    latest_proc = max(per_proc, key=lambda p: _ts_sort_key(per_proc[p].latest_timestamp))
+    occ = per_proc[latest_proc]
+    return issue("8", title,
+                 details=f"segfaults grouped by process: {summary}",
+                 timestamp=occ.latest_timestamp, excerpt=occ.latest_excerpt)
+
+
+_WAD_HTTP_RE = re.compile(r"Http response is not OK.*?http_code=(\d+)", re.I)
+_HTTP_CODE_NOTES = {
+    "0": "path broken / packet loss",
+    "402": "payment / licensing / auth issue",
+}
 
 
 @register("9", "Bad HTTP responses in wad.log")
 def check_9(ctx: Context) -> CheckResult:
     """Find 'Http response is not OK ... http_code=' grouped by http_code."""
-    return _stub(ctx, "9", "Bad HTTP responses in wad.log", "wad.log")
+    title = "Bad HTTP responses in wad.log"
+    if not ctx.reader.present("wad.log"):
+        return skipped("9", title)
+    counts: Counter = Counter()
+    per_code: dict = defaultdict(lambda: Occurrences(keep=1))
+    for line in ctx.reader.read_lines("wad.log"):
+        m = _WAD_HTTP_RE.search(line)
+        if not m:
+            continue
+        code = m.group(1)
+        counts[code] += 1
+        per_code[code].add(parse_timestamp(line), line.strip())
+    if not counts:
+        return ok("9", title)
+    parts = [f"http_code={code} ({_HTTP_CODE_NOTES.get(code, 'non-OK response')}) x{c}"
+             for code, c in sorted(counts.items(), key=lambda kv: -kv[1])]
+    latest_code = max(per_code, key=lambda k: _ts_sort_key(per_code[k].latest_timestamp))
+    occ = per_code[latest_code]
+    return issue("9", title, details="; ".join(parts),
+                 timestamp=occ.latest_timestamp, excerpt=occ.latest_excerpt)
 
 
 @register("10", "Disk usage")
 def check_10(ctx: Context) -> CheckResult:
     """Flag usage > DISK_USAGE_PCT_THRESHOLD on watched mountpoints only."""
-    return _stub(ctx, "10", "Disk usage", "disk_usage")
+    title = "Disk usage"
+    if not ctx.reader.present("disk_usage"):
+        return skipped("10", title)
+    flagged = []  # (mount, pct, raw_line)
+    for line in ctx.reader.read_lines("disk_usage"):
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        mount = parts[-1]
+        if mount not in DISK_WATCHED_MOUNTPOINTS:
+            continue
+        pct = next((int(t[:-1]) for t in parts
+                    if t.endswith("%") and t[:-1].isdigit()), None)
+        if pct is not None and pct > DISK_USAGE_PCT_THRESHOLD:
+            flagged.append((mount, pct, line.strip()))
+    if not flagged:
+        return ok("10", title)
+    flagged.sort(key=lambda f: f[1], reverse=True)
+    details = "; ".join(f"{m} at {p}% (> {DISK_USAGE_PCT_THRESHOLD}%)"
+                        for m, p, _ in flagged)
+    return issue("10", title, details=details,
+                 excerpt="\n".join(l for _, _, l in flagged))
+
+
+_EXT4_DEV_RE = re.compile(r"EXT4-fs.*?\((?P<dev>[^)]+)\)")
+_EXT4_CONT = ("error count since last fsck", "initial error at time",
+              "last error at time")
 
 
 @register("11", "EXT4 filesystem errors")
 def check_11(ctx: Context) -> CheckResult:
     """Find multi-line 'EXT4-fs (<dev>): error' blocks grouped by device."""
-    return _stub(ctx, "11", "EXT4 filesystem errors", "kern.log", "syslog")
+    title = "EXT4 filesystem errors"
+    if not ctx.reader.present("kern.log", "syslog"):
+        return skipped("11", title)
+    lines = _kernel_lines(ctx.reader)
+    counts: Counter = Counter()
+    per_dev: dict = {}  # dev -> (ts, block_text)
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if "EXT4-fs" in line and "error" in line.lower():
+            m = _EXT4_DEV_RE.search(line)
+            dev = m.group("dev") if m else "(unknown)"
+            block = [line.strip()]
+            ts = parse_timestamp(line)
+            j = i + 1
+            while j < n and any(k in lines[j] for k in _EXT4_CONT):
+                block.append(lines[j].strip())
+                j += 1
+            counts[dev] += 1
+            prev = per_dev.get(dev)
+            if prev is None or _ts_sort_key(ts) >= _ts_sort_key(prev[0]):
+                per_dev[dev] = (ts, "\n".join(block))
+            i = j
+        else:
+            i += 1
+    if not counts:
+        return ok("11", title)
+    summary = ", ".join(f"{d} (x{c})" for d, c in counts.most_common())
+    latest_dev = max(per_dev, key=lambda d: _ts_sort_key(per_dev[d][0]))
+    ts, block = per_dev[latest_dev]
+    return issue("11", title, details=f"EXT4 errors by device: {summary}",
+                 timestamp=ts, excerpt=block)
 
 
 @register("Info 1", "CPU cores", section=2)
 def info_1(ctx: Context) -> CheckResult:
     """Core count = max CPU id + 1, read from the top block in curproc."""
-    return _stub(ctx, "Info 1", "CPU cores", "curproc")
+    title = "CPU cores"
+    if not ctx.reader.present("curproc"):
+        return skipped("Info 1", title)
+    cores = _cpu_core_count(ctx.reader)
+    if cores is None:
+        return ok("Info 1", title, details="CPU column not found in curproc top block")
+    return ok("Info 1", title, details=f"{cores} CPU core(s) (max CPU id + 1)")
 
 
 @register("Info 2", "Memory", section=2)
 def info_2(ctx: Context) -> CheckResult:
     """Report total / free / available RAM in GB from meminfo."""
-    return _stub(ctx, "Info 2", "Memory", "meminfo")
+    title = "Memory"
+    if not ctx.reader.present("meminfo"):
+        return skipped("Info 2", title)
+    mem = _memory_gb(ctx.reader)
+    if not mem:
+        return ok("Info 2", title, details="no recognizable meminfo fields")
+    parts = [f"{k}={mem[k]:.1f} GB" for k in ("total", "free", "available") if k in mem]
+    return ok("Info 2", title, details="; ".join(parts))
+
+
+def _fwinfo_field(text: str, *labels: str) -> Optional[str]:
+    """Return the value after the first matching ``label:`` / ``label =`` in fwinfo."""
+    for label in labels:
+        m = re.search(rf"{label}\s*[:=]\s*(.+)", text, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
 
 
 @register("Info 3", "Resource-spec compliance", section=2)
 def info_3(ctx: Context) -> CheckResult:
     """Select sizing table by FW version (boundary FW_TABLE_BOUNDARY) and compare
     required vs actual CPU/RAM/Disk for licensed Max users."""
-    return _stub(ctx, "Info 3", "Resource-spec compliance", "fwinfo")
+    title = "Resource-spec compliance"
+    if not ctx.reader.present("fwinfo"):
+        return skipped("Info 3", title)
+    text = ctx.reader.read_text("fwinfo")
+    model = _fwinfo_field(text, "Model")
+    fw_raw = _fwinfo_field(text, "FW version", "Firmware version", "Firmware", "Version")
+    users_raw = _fwinfo_field(text, "Max users", "Maximum users", "Licensed users")
+    fw = None
+    if fw_raw:
+        mv = re.search(r"(\d+)\.(\d+)", fw_raw)
+        if mv:
+            fw = (int(mv.group(1)), int(mv.group(2)))
+    max_users = None
+    if users_raw:
+        mu = re.search(r"(\d[\d,]*)", users_raw)
+        if mu:
+            max_users = int(mu.group(1).replace(",", ""))
+    if fw is None or max_users is None:
+        return ok("Info 3", title,
+                  details=f"insufficient fwinfo (model={model}, fw={fw_raw}, "
+                          f"max_users={users_raw})")
+    table = RESOURCE_TABLE_A if fw < FW_TABLE_BOUNDARY else RESOURCE_TABLE_B
+    table_name = "A (FW<8.0)" if fw < FW_TABLE_BOUNDARY else "B (FW>=8.0)"
+    row = next((r for r in table if max_users <= r[0]), table[-1])
+    req_cpu, req_ram, req_disk = row[1], row[2], row[3]
+    actual_cpu = _cpu_core_count(ctx.reader)
+    actual_ram = _memory_gb(ctx.reader).get("total")
+    mismatches = []
+    if actual_cpu is not None and actual_cpu < req_cpu:
+        mismatches.append(f"CPU {actual_cpu} < required {req_cpu}")
+    if actual_ram is not None and actual_ram + 0.5 < req_ram:
+        mismatches.append(f"RAM {actual_ram:.1f}GB < required {req_ram}GB")
+    block = "\n".join([
+        f"Model: {model}",
+        f"FW version: {fw_raw} -> table {table_name}",
+        f"Max users: {max_users}",
+        f"Required: {req_cpu} CPU / {req_ram} GB RAM / {req_disk} TB disk",
+        f"Actual: CPU={actual_cpu if actual_cpu is not None else '?'}, "
+        f"RAM={f'{actual_ram:.1f}GB' if actual_ram is not None else '?'}",
+    ])
+    status = Status.ISSUE if mismatches else Status.OK
+    details = ("under-provisioned: " + "; ".join(mismatches)) if mismatches \
+        else "meets sizing table"
+    return CheckResult("Info 3", title, status, details=details, excerpt=block)
 
 
 @register("Info 4", "HA operation", section=2)
 def info_4(ctx: Context) -> CheckResult:
     """Print the HA info block; flag status/role errors."""
-    return _stub(ctx, "Info 4", "HA operation", "fwinfo")
+    title = "HA operation"
+    if not ctx.reader.present("fwinfo"):
+        return skipped("Info 4", title)
+    block = []
+    in_ha = False
+    for line in ctx.reader.read_lines("fwinfo"):
+        if re.search(r"HA info", line, re.I):
+            in_ha, block = True, [line.strip()]
+            continue
+        if in_ha:
+            if not line.strip():
+                break
+            block.append(line.strip())
+    if not block:
+        return ok("Info 4", title, details="no HA info block found")
+    block_text = "\n".join(block)
+    reasons = []
+    if re.search(r"Status:\s*Status Error", block_text, re.I):
+        reasons.append("Status: Status Error")
+    if re.search(r"Role:\s*Determining", block_text, re.I) and \
+            re.search(r"Enabled:\s*1", block_text):
+        reasons.append("Role: Determining while Enabled=1")
+    status = Status.ISSUE if reasons else Status.OK
+    details = ("HA error: " + "; ".join(reasons)) if reasons else "HA info present"
+    return CheckResult("Info 4", title, status, details=details, excerpt=block_text)
+
+
+# Info 5 normalization: collapse volatile tokens so structurally-identical lines group.
+_INFO5_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_INFO5_FQDN_RE = re.compile(r"\b(?:[A-Za-z0-9\-]+\.)+[A-Za-z]{2,}\b")
+_INFO5_ISO_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?")
+
+
+def _normalize_logline(line: str) -> str:
+    """Strip timestamps, IPs, and FQDNs so recurring lines collapse together."""
+    s = _RE_FORTI.sub("date=<TS> time=<TS>", line)
+    s = _INFO5_ISO_RE.sub("<TS>", s)
+    s = _INFO5_IP_RE.sub("<IP>", s)
+    s = _INFO5_FQDN_RE.sub("<FQDN>", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 @register("Info 5", "Top recurring log lines", section=2)
 def info_5(ctx: Context) -> CheckResult:
     """Show the 10 most frequent log lines over LOOKBACK_DAYS, after normalizing out
     timestamps/IPs/FQDNs."""
-    return _stub(ctx, "Info 5", "Top recurring log lines", "fac.logs")
+    title = "Top recurring log lines"
+    if not ctx.reader.present("fac.logs"):
+        return skipped("Info 5", title)
+    stamped = [(parse_timestamp(l), l) for l in ctx.reader.read_lines("fac.logs")]
+    times = [t for t, _ in stamped if t is not None]
+    horizon = (max(times) - timedelta(days=LOOKBACK_DAYS)) if times else None
+    counter: Counter = Counter()
+    for ts, line in stamped:
+        if horizon is not None and ts is not None and ts < horizon:
+            continue
+        norm = _normalize_logline(line)
+        if norm:
+            counter[norm] += 1
+    if not counter:
+        return ok("Info 5", title, details="no log lines in window")
+    top = counter.most_common(INFO_TOP_RECURRING)
+    block = "\n".join(f"{c:>6}  {text[:120]}" for text, c in top)
+    return CheckResult("Info 5", title, Status.OK,
+                       details=f"top {len(top)} recurring normalized lines "
+                               f"(last {LOOKBACK_DAYS}d)",
+                       excerpt=block)
 
 
 # ---------------------------------------------------------------------------
@@ -558,13 +1206,16 @@ _BANNER = "=" * 78
 def _render_block(r: CheckResult) -> list[str]:
     lines = [_RULE, f"Check {r.number} - {r.title}", f"  Result    : {r.status}"]
     if r.details:
-        lines.append(f"  Details   : {r.details}")
+        detail_lines = r.details.splitlines() or [""]
+        lines.append(f"  Details   : {detail_lines[0]}")
+        lines.extend(f"              {extra}" for extra in detail_lines[1:])
     if r.status == Status.ISSUE:
         lines.append(f"  Timestamp : {to_display(r.timestamp)}")
-        excerpt = r.excerpt if r.excerpt else "(none)"
+    # Render any non-empty excerpt, including the multi-line Info blocks (HA, sizing,
+    # top recurring lines), not just ISSUE excerpts.
+    if r.excerpt:
         lines.append("  Log excerpt:")
-        for ln in excerpt.splitlines() or [""]:
-            lines.append(f"    {ln}")
+        lines.extend(f"    {ln}" for ln in r.excerpt.splitlines() or [""])
     return lines
 
 
