@@ -1282,15 +1282,16 @@ def render_report(results: list[tuple[Check, CheckResult]]) -> str:
             out.append("  (no checks)")
             out.append("")
 
-    section(1, "SECTION 1 - ISSUES FOUND")
-    section(2, "SECTION 2 - GENERAL INFORMATION")
+    section(1, "ISSUES FOUND")
+    section(2, "GENERAL INFORMATION")
     return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
-# (7) HTML reporter -- the "hacker interface". Same CheckResult data as the text
-# reporter, rendered as one self-contained page (inline CSS + JS, no external
-# assets, stdlib only -- safe for an air-gapped box).
+# (7) HTML reporter -- the "diagnostic dossier". Same CheckResult data as the
+# text reporter, rendered as one professional, self-contained page. CSS/JS are
+# inline (stdlib only); web fonts load from Google Fonts with a system-font
+# fallback, so the page still renders on an air-gapped box.
 # ---------------------------------------------------------------------------
 
 # Map each status to a CSS class so colors are driven by per-theme variables.
@@ -1317,167 +1318,301 @@ def _html_block(r: CheckResult) -> str:
     parts = [f'<article class="card card--{cls}" data-status="{r.status}">']
     parts.append('  <header class="card__head">')
     parts.append(f'    <span class="card__num">{_esc(r.number)}</span>')
-    parts.append(f'    <span class="card__title">{_esc(r.title)}</span>')
-    parts.append(f'    <span class="badge badge--{cls}">{_esc(r.status)}</span>')
+    parts.append(f'    <h3 class="card__title">{_esc(r.title)}</h3>')
+    parts.append(f'    <span class="badge badge--{cls}"><span class="bdot"></span>{_esc(r.status)}</span>')
     parts.append('  </header>')
     if r.details:
         parts.append(f'  <div class="card__details">{_esc(r.details)}</div>')
     if r.status == Status.ISSUE:
-        parts.append(f'  <div class="card__meta">timestamp: {_esc(to_display(r.timestamp))}</div>')
+        parts.append(f'  <div class="card__meta">Detected {_esc(to_display(r.timestamp))}</div>')
     if r.excerpt:
-        parts.append(f'  <pre class="card__excerpt">{_esc(r.excerpt)}</pre>')
+        parts.append('  <div class="card__excerpt">')
+        parts.append(f'    <div class="excerpt__label">{_esc(r.excerpt_label)}</div>')
+        parts.append(f'    <pre>{_esc(r.excerpt)}</pre>')
+        parts.append('  </div>')
     parts.append('</article>')
     return "\n".join(parts)
 
 
-# Inline stylesheet. Themes are switched by the ``data-theme`` attribute on <html>;
-# each theme just rebinds the CSS custom properties.
+# Inline stylesheet. Light is the default; dark is switched by the ``data-mode``
+# attribute on <html> (set before paint by a tiny head script). Each mode just
+# rebinds the CSS custom properties; status colours stay semantically consistent.
 _HTML_STYLE = """\
-:root, html[data-theme="terminal"] {
-  --bg:#020a02; --bg2:#0a160a; --fg:#39ff64; --dim:#1f7a35; --line:#114d20;
-  --glow:0 0 6px rgba(57,255,100,.55); --accent:#39ff64;
-  --ok:#39ff64; --skipped:#5a7a5a; --issue:#ff5b5b; --errored:#ffb347;
+:root {
+  --canvas:#F4F5F7; --card:#FFFFFF; --ink:#14181F; --muted:#4B5563;
+  --line:#E3E6EB; --accent:#1F49C4; --chip:#EEF1F6; --chip-ink:#3B4453;
+  --issue:#C6362F; --errored:#9A5B00; --ok:#1E7A54; --skipped:#6B7480;
+  --issue-soft:#FBEDEC; --errored-soft:#FAF1E1; --ok-soft:#E9F5EF; --skipped-soft:#EEF0F3;
+  --shadow:0 1px 2px rgba(20,24,31,.05), 0 4px 14px rgba(20,24,31,.05);
+  --font-display:"Space Grotesk",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
-html[data-theme="amber"] {
-  --bg:#0d0700; --bg2:#1a1000; --fg:#ffb000; --dim:#8a5e00; --line:#5a3d00;
-  --glow:0 0 6px rgba(255,176,0,.55); --accent:#ffd060;
-  --ok:#ffd060; --skipped:#8a6a2a; --issue:#ff6a3d; --errored:#ffe08a;
-}
-html[data-theme="neon"] {
-  --bg:#070512; --bg2:#100a26; --fg:#00f0ff; --dim:#5a4b8a; --line:#3a2a66;
-  --glow:0 0 8px rgba(0,240,255,.6); --accent:#ff3df0;
-  --ok:#00ff9c; --skipped:#6a6a8a; --issue:#ff3df0; --errored:#ffd23d;
+html[data-mode="dark"] {
+  --canvas:#0E141C; --card:#161E2A; --ink:#E9EDF3; --muted:#98A3B2;
+  --line:#243040; --accent:#7FA0FF; --chip:#1E2836; --chip-ink:#AEB9C8;
+  --issue:#F2705F; --errored:#E3A24A; --ok:#4FC08A; --skipped:#8A95A4;
+  --issue-soft:#2A1A18; --errored-soft:#2A2417; --ok-soft:#14271E; --skipped-soft:#1B232E;
+  --shadow:0 1px 2px rgba(0,0,0,.35), 0 6px 18px rgba(0,0,0,.4);
 }
 * { box-sizing:border-box; }
+html { color-scheme:light dark; }
 body {
-  margin:0; padding:0 0 4rem; background:var(--bg); color:var(--fg);
-  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
-  font-size:14px; line-height:1.5; text-shadow:var(--glow);
+  margin:0; padding:0 0 3rem; background:var(--canvas); color:var(--ink);
+  font-family:var(--font-body); font-size:15px; line-height:1.55;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
 }
-/* CRT scanline overlay */
-body::before {
-  content:""; position:fixed; inset:0; pointer-events:none; z-index:9999;
-  background:repeating-linear-gradient(rgba(0,0,0,0) 0 2px, rgba(0,0,0,.18) 2px 4px);
-  mix-blend-mode:multiply;
-}
-.wrap { max-width:1000px; margin:0 auto; padding:1.5rem; }
-header.top { border:1px solid var(--line); background:var(--bg2); padding:1rem 1.25rem; margin-bottom:1.25rem; }
-.brand { font-size:2rem; font-weight:bold; letter-spacing:.15em; color:var(--accent); }
-.brand .cursor { animation:blink 1s step-end infinite; }
-@keyframes blink { 50% { opacity:0; } }
-.subtitle { color:var(--dim); margin-top:.25rem; word-break:break-all; }
-.controls { margin-top:.9rem; display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; }
-.controls .label { color:var(--dim); margin-right:.25rem; }
-button.btn {
-  background:transparent; color:var(--fg); border:1px solid var(--line);
-  font:inherit; text-shadow:var(--glow); padding:.25rem .6rem; cursor:pointer;
-}
-button.btn:hover { border-color:var(--accent); color:var(--accent); }
-button.btn.active { border-color:var(--accent); color:var(--bg); background:var(--accent); text-shadow:none; }
-.tiles { display:flex; flex-wrap:wrap; gap:.75rem; margin-bottom:1.25rem; }
-.tile { flex:1 1 8rem; border:1px solid var(--line); background:var(--bg2); padding:.75rem 1rem; }
-.tile .n { font-size:1.8rem; font-weight:bold; }
-.tile .k { color:var(--dim); text-transform:uppercase; letter-spacing:.1em; font-size:.8rem; }
-.tile--ok .n{color:var(--ok);} .tile--skipped .n{color:var(--skipped);}
-.tile--issue .n{color:var(--issue);} .tile--errored .n{color:var(--errored);}
-h2.section { border-bottom:1px solid var(--line); color:var(--accent); letter-spacing:.1em; margin:1.5rem 0 .75rem; padding-bottom:.3rem; }
-.card { border:1px solid var(--line); border-left-width:4px; background:var(--bg2); padding:.75rem 1rem; margin-bottom:.6rem; }
-.card--ok{border-left-color:var(--ok);} .card--skipped{border-left-color:var(--skipped);}
-.card--issue{border-left-color:var(--issue);} .card--errored{border-left-color:var(--errored);}
-.card__head { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
-.card__num { color:var(--dim); }
-.card__title { font-weight:bold; flex:1 1 auto; }
-.badge { font-size:.75rem; padding:.1rem .5rem; border:1px solid currentColor; letter-spacing:.08em; }
-.badge--ok{color:var(--ok);} .badge--skipped{color:var(--skipped);}
-.badge--issue{color:var(--issue);} .badge--errored{color:var(--errored);}
-.card__details { margin-top:.5rem; white-space:pre-wrap; }
-.card__meta { margin-top:.35rem; color:var(--dim); }
-.card__excerpt { margin:.5rem 0 0; padding:.6rem; background:var(--bg); border:1px solid var(--line);
-  color:var(--dim); overflow-x:auto; white-space:pre; }
+.wrap { max-width:960px; margin:0 auto; padding:2.5rem 1.5rem; }
+
+/* masthead */
+.masthead { display:flex; justify-content:space-between; align-items:flex-start;
+  gap:1.5rem; flex-wrap:wrap; padding-bottom:1.15rem; border-bottom:1px solid var(--line); }
+.brand-block { display:flex; flex-direction:column; gap:.2rem; }
+.brand { font-family:var(--font-display); font-weight:700; font-size:1.75rem;
+  letter-spacing:-.02em; line-height:1; color:var(--ink); }
+.brand .dot { color:var(--accent); }
+.tagline { color:var(--muted); font-size:.92rem; }
+.meta-block { display:flex; flex-direction:column; align-items:flex-end; gap:.25rem; text-align:right; }
+.meta-row { font-family:var(--font-mono); font-size:.76rem; color:var(--muted); word-break:break-all; }
+.meta-row b { color:var(--ink); font-weight:500; }
+.mode-toggle { margin-top:.55rem; background:var(--chip); color:var(--chip-ink);
+  border:1px solid var(--line); border-radius:999px; font-family:var(--font-body);
+  font-size:.78rem; padding:.35rem .85rem; cursor:pointer; }
+.mode-toggle:hover { border-color:var(--accent); color:var(--accent); }
+
+/* verdict banner (signature) */
+.verdict { margin:1.9rem 0; background:var(--card); border:1px solid var(--line);
+  border-radius:14px; box-shadow:var(--shadow); padding:1.5rem 1.6rem; }
+.verdict__head { display:flex; align-items:center; gap:.8rem; }
+.verdict__dot { width:.9rem; height:.9rem; border-radius:50%; flex:0 0 auto; margin-top:.15rem; }
+.verdict__text { font-family:var(--font-display); font-weight:600; font-size:1.4rem;
+  letter-spacing:-.01em; line-height:1.2; color:var(--ink); }
+.verdict__sub { color:var(--muted); font-size:.9rem; margin-top:.2rem; }
+.bar { display:flex; height:.6rem; border-radius:999px; overflow:hidden;
+  margin:1.3rem 0 1.1rem; background:var(--chip); }
+.seg { display:block; height:100%; }
+.seg--ok{background:var(--ok);} .seg--skipped{background:var(--skipped);}
+.seg--issue{background:var(--issue);} .seg--errored{background:var(--errored);}
+.legend { display:flex; flex-wrap:wrap; gap:.55rem; }
+.chip { display:inline-flex; align-items:center; gap:.5rem; background:transparent;
+  border:1px solid var(--line); border-radius:999px; padding:.35rem .75rem;
+  font-family:var(--font-body); font-size:.82rem; color:var(--ink); cursor:pointer; }
+.chip:hover { border-color:var(--accent); }
+.chip.off { opacity:.4; }
+.chip .swatch { width:.6rem; height:.6rem; border-radius:2px; flex:0 0 auto; }
+.chip .swatch--ok{background:var(--ok);} .chip .swatch--skipped{background:var(--skipped);}
+.chip .swatch--issue{background:var(--issue);} .chip .swatch--errored{background:var(--errored);}
+.chip .cnt { font-family:var(--font-mono); font-weight:600; }
+.chip .lbl { color:var(--muted); }
+
+/* section headings -- by name, no numbers */
+.section { display:flex; align-items:baseline; gap:.65rem; margin:2.4rem 0 1.1rem;
+  padding-bottom:.5rem; border-bottom:1px solid var(--line); }
+.section h2 { font-family:var(--font-display); font-weight:600; font-size:1.2rem;
+  letter-spacing:-.01em; margin:0; color:var(--ink); }
+.section .count { font-family:var(--font-mono); font-size:.8rem; color:var(--muted); }
+.empty { color:var(--muted); font-style:italic; margin:.5rem 0 0; }
+
+/* finding cards */
+.card { position:relative; background:var(--card); border:1px solid var(--line);
+  border-radius:12px; box-shadow:var(--shadow); overflow:hidden;
+  padding:1.05rem 1.25rem 1.05rem 1.4rem; margin-bottom:.85rem; }
+.card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; }
+.card--ok::before{background:var(--ok);} .card--skipped::before{background:var(--skipped);}
+.card--issue::before{background:var(--issue);} .card--errored::before{background:var(--errored);}
+.card__head { display:flex; align-items:center; gap:.7rem; flex-wrap:wrap; }
+.card__num { font-family:var(--font-mono); font-size:.76rem; font-weight:600;
+  color:var(--chip-ink); background:var(--chip); border-radius:6px; padding:.15rem .45rem; }
+.card__title { font-family:var(--font-body); font-weight:600; font-size:1rem;
+  margin:0; flex:1 1 auto; color:var(--ink); }
+.badge { display:inline-flex; align-items:center; gap:.4rem; font-family:var(--font-body);
+  font-size:.72rem; font-weight:600; letter-spacing:.03em; text-transform:uppercase;
+  border-radius:999px; padding:.24rem .6rem; }
+.badge .bdot { width:.5rem; height:.5rem; border-radius:50%; background:currentColor; }
+.badge--ok{color:var(--ok); background:var(--ok-soft);}
+.badge--skipped{color:var(--skipped); background:var(--skipped-soft);}
+.badge--issue{color:var(--issue); background:var(--issue-soft);}
+.badge--errored{color:var(--errored); background:var(--errored-soft);}
+.card__details { margin:.65rem 0 0; white-space:pre-wrap; color:var(--ink); }
+.card__meta { margin:.55rem 0 0; font-family:var(--font-mono); font-size:.78rem; color:var(--muted); }
+.card__excerpt { margin-top:.75rem; }
+.excerpt__label { font-size:.72rem; color:var(--muted); margin-bottom:.35rem;
+  text-transform:uppercase; letter-spacing:.06em; }
+.card__excerpt pre { margin:0; padding:.75rem .85rem; background:var(--canvas);
+  border:1px solid var(--line); border-radius:8px; font-family:var(--font-mono);
+  font-size:.8rem; line-height:1.5; color:var(--ink); overflow-x:auto; white-space:pre; }
+
+/* footer */
+.foot { margin-top:2.5rem; padding-top:1rem; border-top:1px solid var(--line);
+  color:var(--muted); font-size:.78rem; font-family:var(--font-mono); }
+
+/* status colour helpers */
+.vd--ok{background:var(--ok);} .vd--skipped{background:var(--skipped);}
+.vd--issue{background:var(--issue);} .vd--errored{background:var(--errored);}
+
 /* status filtering: hiding a status adds a body class */
 body.hide-OK .card[data-status="OK"],
 body.hide-SKIPPED .card[data-status="SKIPPED"],
 body.hide-ISSUE .card[data-status="ISSUE"],
 body.hide-ERRORED .card[data-status="ERRORED"] { display:none; }
+
+/* focus + motion */
+button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+@media (prefers-reduced-motion: no-preference) {
+  .seg { animation:grow .7s ease-out both; transform-origin:left; }
+}
+@keyframes grow { from { transform:scaleX(0); } to { transform:scaleX(1); } }
+
+/* responsive */
+@media (max-width:560px) {
+  .wrap { padding:1.6rem 1.1rem; }
+  .masthead { flex-direction:column; }
+  .meta-block { align-items:flex-start; text-align:left; }
+}
 """
 
-# Inline script: theme switching (persisted) + status-filter toggles. No dependencies.
+# Runs before paint (in <head>) to set the colour mode with no flash: honours a
+# saved choice, else the OS preference.
+_HTML_MODE_BOOT = """\
+(function () {
+  try {
+    var m = localStorage.getItem("faclog-mode");
+    if (!m) m = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.documentElement.setAttribute("data-mode", m);
+  } catch (e) {
+    document.documentElement.setAttribute("data-mode", "light");
+  }
+})();
+"""
+
+# Inline script (end of <body>): light/dark toggle (persisted) + status filters.
 _HTML_SCRIPT = """\
 (function () {
   var root = document.documentElement, body = document.body;
-  function setTheme(t) {
-    root.setAttribute("data-theme", t);
-    try { localStorage.setItem("faclog-theme", t); } catch (e) {}
-    document.querySelectorAll("button[data-theme]").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-theme") === t);
+  var toggle = document.getElementById("mode-toggle");
+  var label = document.getElementById("mode-label");
+  function syncLabel() {
+    var dark = root.getAttribute("data-mode") === "dark";
+    if (label) label.textContent = dark ? "Light mode" : "Dark mode";
+  }
+  syncLabel();
+  if (toggle) {
+    toggle.addEventListener("click", function () {
+      var next = root.getAttribute("data-mode") === "dark" ? "light" : "dark";
+      root.setAttribute("data-mode", next);
+      try { localStorage.setItem("faclog-mode", next); } catch (e) {}
+      syncLabel();
     });
   }
-  var saved = null;
-  try { saved = localStorage.getItem("faclog-theme"); } catch (e) {}
-  setTheme(saved || "terminal");
-  document.querySelectorAll("button[data-theme]").forEach(function (b) {
-    b.addEventListener("click", function () { setTheme(b.getAttribute("data-theme")); });
-  });
-  document.querySelectorAll("button[data-filter]").forEach(function (b) {
+  document.querySelectorAll(".chip[data-filter]").forEach(function (b) {
     b.addEventListener("click", function () {
-      var cls = "hide-" + b.getAttribute("data-filter");
-      var hidden = body.classList.toggle(cls);
-      b.classList.toggle("active", !hidden);
+      var hidden = body.classList.toggle("hide-" + b.getAttribute("data-filter"));
+      b.classList.toggle("off", hidden);
+      b.setAttribute("aria-pressed", (!hidden).toString());
     });
   });
 })();
 """
 
 
+def _verdict(counts: Counter) -> tuple[str, str, str]:
+    """Derive (status-class, plain-language headline, sub-line) from the counts."""
+    n_issue = counts.get(Status.ISSUE, 0)
+    n_err = counts.get(Status.ERRORED, 0)
+    total = sum(counts.values())
+    if n_issue:
+        verb = "needs" if n_issue == 1 else "need"
+        noun = "issue" if n_issue == 1 else "issues"
+        headline = f"{n_issue} {noun} {verb} attention"
+        cls = "issue"
+    elif n_err:
+        noun = "check" if n_err == 1 else "checks"
+        headline = f"{n_err} {noun} couldn't run"
+        cls = "errored"
+    else:
+        headline = "All clear — no issues found"
+        cls = "ok"
+    plural = "check" if total == 1 else "checks"
+    sub = f"{total} {plural} run against this bundle"
+    return cls, headline, sub
+
+
 def render_report_html(results: list[tuple[Check, CheckResult]], bundle_dir: str) -> str:
-    """Render all results as one self-contained HTML page (the "hacker interface")."""
+    """Render all results as one self-contained HTML page (the "diagnostic dossier")."""
     counts = Counter(res.status for _, res in results)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total = sum(counts.values()) or 1  # avoid divide-by-zero for the proportional bar
 
-    tiles = "\n".join(
-        f'<div class="tile tile--{_status_class(st)}"><div class="n">{counts.get(st, 0)}</div>'
-        f'<div class="k">{st.lower()}</div></div>'
-        for st in (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
+    vcls, headline, sub = _verdict(counts)
+
+    order = (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
+    segments = "".join(
+        f'<span class="seg seg--{_status_class(st)}" style="width:{counts[st] / total * 100:.4f}%"></span>'
+        for st in order if counts.get(st, 0)
+    )
+    legend = "\n".join(
+        f'<button class="chip" type="button" data-filter="{st}" aria-pressed="true">'
+        f'<span class="swatch swatch--{_status_class(st)}"></span>'
+        f'<span class="cnt">{counts.get(st, 0)}</span>'
+        f'<span class="lbl">{st.lower()}</span></button>'
+        for st in order
     )
 
-    filter_btns = "\n".join(
-        f'<button class="btn active" data-filter="{st}">{st}</button>'
-        for st in (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
-    )
-
-    def section_html(num: int, banner: str) -> str:
+    def section_html(num: int, name: str) -> str:
         blocks = [_html_block(res) for chk, res in results if chk.section == num]
-        body = "\n".join(blocks) if blocks else '<p class="card__meta">(no checks)</p>'
-        return f'<h2 class="section">{_esc(banner)}</h2>\n{body}'
+        body = "\n".join(blocks) if blocks else '<p class="empty">No checks in this section.</p>'
+        return (
+            f'<div class="section"><h2>{_esc(name)}</h2>'
+            f'<span class="count">{len(blocks)}</span></div>\n{body}'
+        )
 
     return f"""<!DOCTYPE html>
-<html lang="en" data-theme="terminal">
+<html lang="en" data-mode="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>faclog report</title>
+<title>faclog &middot; FortiAuthenticator diagnostic report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
 {_HTML_STYLE}</style>
+<script>{_HTML_MODE_BOOT}</script>
 </head>
 <body>
 <div class="wrap">
-<header class="top">
-  <div class="brand">faclog<span class="cursor">_</span></div>
-  <div class="subtitle">FortiAuthenticator log analysis &middot; bundle: {_esc(bundle_dir)} &middot; generated {_esc(generated)}</div>
-  <div class="controls">
-    <span class="label">theme:</span>
-    <button class="btn" data-theme="terminal">terminal</button>
-    <button class="btn" data-theme="amber">amber</button>
-    <button class="btn" data-theme="neon">neon</button>
-    <span class="label" style="margin-left:1rem;">filter:</span>
-    {filter_btns}
+<header class="masthead">
+  <div class="brand-block">
+    <div class="brand">faclog<span class="dot">.</span></div>
+    <div class="tagline">FortiAuthenticator diagnostic report</div>
+  </div>
+  <div class="meta-block">
+    <div class="meta-row">bundle <b>{_esc(bundle_dir)}</b></div>
+    <div class="meta-row">generated <b>{_esc(generated)}</b></div>
+    <button class="mode-toggle" id="mode-toggle" type="button" aria-label="Toggle colour theme">
+      <span id="mode-label">Dark mode</span>
+    </button>
   </div>
 </header>
-<div class="tiles">
-{tiles}
-</div>
-{section_html(1, "SECTION 1 - ISSUES FOUND")}
-{section_html(2, "SECTION 2 - GENERAL INFORMATION")}
+
+<section class="verdict">
+  <div class="verdict__head">
+    <span class="verdict__dot vd--{vcls}"></span>
+    <div>
+      <div class="verdict__text">{_esc(headline)}</div>
+      <div class="verdict__sub">{_esc(sub)}</div>
+    </div>
+  </div>
+  <div class="bar">{segments}</div>
+  <div class="legend">
+{legend}
+  </div>
+</section>
+
+{section_html(1, "Issues Found")}
+{section_html(2, "General Information")}
+
+<footer class="foot">faclog &middot; generated {_esc(generated)}</footer>
 </div>
 <script>
 {_HTML_SCRIPT}</script>

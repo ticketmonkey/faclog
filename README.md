@@ -39,8 +39,8 @@ python3 faclog.py /path/to/bundle -o report.txt
 # Also run the live reachability probe (Check 6)
 python3 faclog.py /path/to/bundle --check-network
 
-# Render a self-contained HTML report (open in any browser; three switchable
-# "hacker" themes -- terminal / amber CRT / neon -- plus status filters)
+# Render a self-contained HTML report (open in any browser; professional
+# "diagnostic dossier" look with a light/dark toggle and status filters)
 python3 faclog.py /path/to/bundle -o report.html
 python3 faclog.py /path/to/bundle --html > report.html
 ```
@@ -66,10 +66,10 @@ suffixes (`access_log`, `access_log.1`, …) are picked up automatically.
 
 ## Output
 
-A plain-text report with two banner sections:
+A plain-text report (or a self-contained HTML page with `--html`) with two named sections:
 
-- **SECTION 1 — ISSUES FOUND**: Checks `1, 2a, 2b, 3, 4a, 4b, 5, 6, 7, 8, 9, 10, 11`.
-- **SECTION 2 — GENERAL INFORMATION**: `Info 1`–`Info 5`.
+- **Issues Found**: Checks `1, 2a, 2b, 3, 4a, 4b, 5, 6, 7, 8, 9, 10, 11`.
+- **General Information**: `Info 1`–`Info 5`.
 
 Every check always emits one of four results, and the numbering is fixed (it never drifts when
 checks are skipped):
