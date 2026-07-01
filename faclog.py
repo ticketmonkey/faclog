@@ -1538,23 +1538,35 @@ def _esc(text: str) -> str:
 
 
 def _html_block(r: CheckResult) -> str:
-    """Render one check as a status-classed card, mirroring ``_render_block``."""
+    """Render one check as a status-toned HUD card, mirroring the design's CheckCard."""
     cls = _status_class(r.status)
     parts = [f'<article class="card card--{cls}" data-status="{r.status}">']
-    parts.append('  <header class="card__head">')
-    parts.append(f'    <span class="card__num">{_esc(r.number)}</span>')
-    parts.append(f'    <h3 class="card__title">{_esc(r.title)}</h3>')
-    parts.append(f'    <span class="badge badge--{cls}"><span class="bdot"></span>{_esc(r.status)}</span>')
-    parts.append('  </header>')
+    parts.append('  <span class="card__bar"></span>')
+    parts.append('  <span class="card__corner card__corner--tl"></span>')
+    parts.append('  <span class="card__corner card__corner--br"></span>')
+    parts.append('  <div class="card__pad">')
+    parts.append('    <div class="card__head">')
+    parts.append(f'      <span class="card__num">{_esc(r.number)}</span>')
+    parts.append(f'      <h3 class="card__title">{_esc(r.title)}</h3>')
+    parts.append(f'      <span class="card__badge"><span class="card__badge-dot"></span>{_esc(r.status)}</span>')
+    parts.append('    </div>')
     if r.details:
-        parts.append(f'  <div class="card__details">{_esc(r.details)}</div>')
-    if r.status == Status.ISSUE:
-        parts.append(f'  <div class="card__meta">Detected {_esc(to_display(r.timestamp))}</div>')
+        parts.append(f'    <p class="card__details">{_esc(r.details)}</p>')
+    if r.status == Status.ISSUE and r.timestamp is not None:
+        parts.append(
+            '    <div class="card__meta"><span class="card__meta-arrow">&#9656;</span>'
+            f'DETECTED {_esc(to_display(r.timestamp))}</div>'
+        )
     if r.excerpt:
-        parts.append('  <div class="card__excerpt">')
-        parts.append(f'    <div class="excerpt__label">{_esc(r.excerpt_label)}</div>')
-        parts.append(f'    <pre>{_esc(r.excerpt)}</pre>')
-        parts.append('  </div>')
+        parts.append('    <div class="excerpt">')
+        parts.append('      <div class="excerpt__head">')
+        parts.append('        <span class="excerpt__dot"></span>')
+        parts.append(f'        <span class="excerpt__label">{_esc(r.excerpt_label)}</span>')
+        parts.append('        <span class="excerpt__tag">log stream</span>')
+        parts.append('      </div>')
+        parts.append(f'      <pre class="excerpt__body">{_esc(r.excerpt)}</pre>')
+        parts.append('    </div>')
+    parts.append('  </div>')
     parts.append('</article>')
     return "\n".join(parts)
 
@@ -1564,116 +1576,171 @@ def _html_block(r: CheckResult) -> str:
 # rebinds the CSS custom properties; status colours stay semantically consistent.
 _HTML_STYLE = """\
 :root {
-  --canvas:#F4F5F7; --card:#FFFFFF; --ink:#14181F; --muted:#4B5563;
-  --line:#E3E6EB; --accent:#1F49C4; --chip:#EEF1F6; --chip-ink:#3B4453;
-  --issue:#C6362F; --errored:#9A5B00; --ok:#1E7A54; --skipped:#6B7480;
-  --issue-soft:#FBEDEC; --errored-soft:#FAF1E1; --ok-soft:#E9F5EF; --skipped-soft:#EEF0F3;
-  --shadow:0 1px 2px rgba(20,24,31,.05), 0 4px 14px rgba(20,24,31,.05);
-  --font-display:"Space Grotesk",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --font-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-}
-html[data-mode="dark"] {
-  --canvas:#0E141C; --card:#161E2A; --ink:#E9EDF3; --muted:#98A3B2;
-  --line:#243040; --accent:#7FA0FF; --chip:#1E2836; --chip-ink:#AEB9C8;
-  --issue:#F2705F; --errored:#E3A24A; --ok:#4FC08A; --skipped:#8A95A4;
-  --issue-soft:#2A1A18; --errored-soft:#2A2417; --ok-soft:#14271E; --skipped-soft:#1B232E;
-  --shadow:0 1px 2px rgba(0,0,0,.35), 0 6px 18px rgba(0,0,0,.4);
+  --bg:#0a1512; --ink:#e4f1ec; --teal:#22d3c5;
+  --font-display:'Chivo',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --font-body:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --font-mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 * { box-sizing:border-box; }
-html { color-scheme:light dark; }
+html, body { margin:0; padding:0; background:#0a1512; }
 body {
-  margin:0; padding:0 0 3rem; background:var(--canvas); color:var(--ink);
-  font-family:var(--font-body); font-size:15px; line-height:1.55;
+  background-color:#0a1512;
+  background-image:linear-gradient(rgba(110,190,170,0.045) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(110,190,170,0.045) 1px,transparent 1px);
+  background-size:44px 44px;
+  font-family:var(--font-body); color:var(--ink);
   -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
 }
-.wrap { max-width:960px; margin:0 auto; padding:2.5rem 1.5rem; }
+.page { position:relative; min-height:100vh; overflow:hidden; }
+.page__glow { position:absolute; inset:0 0 auto 0; height:340px; pointer-events:none;
+  background:radial-gradient(80% 100% at 50% 0%, rgba(46,230,182,0.08), transparent 70%); }
+.wrap { position:relative; z-index:1; max-width:1060px; margin:0 auto; padding:34px 30px 90px; }
 
-/* masthead */
-.masthead { display:flex; justify-content:space-between; align-items:flex-start;
-  gap:1.5rem; flex-wrap:wrap; padding-bottom:1.15rem; border-bottom:1px solid var(--line); }
-.brand-block { display:flex; flex-direction:column; gap:.2rem; }
-.brand { font-family:var(--font-display); font-weight:700; font-size:1.75rem;
-  letter-spacing:-.02em; line-height:1; color:var(--ink); }
-.brand .dot { color:var(--accent); }
-.tagline { color:var(--muted); font-size:.92rem; }
-.meta-block { display:flex; flex-direction:column; align-items:flex-end; gap:.25rem; text-align:right; }
-.meta-row { font-family:var(--font-mono); font-size:.76rem; color:var(--muted); word-break:break-all; }
-.meta-row b { color:var(--ink); font-weight:500; }
-.mode-toggle { margin-top:.55rem; background:var(--chip); color:var(--chip-ink);
-  border:1px solid var(--line); border-radius:999px; font-family:var(--font-body);
-  font-size:.78rem; padding:.35rem .85rem; cursor:pointer; }
-.mode-toggle:hover { border-color:var(--accent); color:var(--accent); }
+/* shared hexagon */
+.clip-hex { clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%); }
+.hex { position:relative; flex:none; }
+.hex__core { position:absolute; inset:0; display:grid; place-items:center; }
+.hex--logo { width:34px; height:38px; }
+.hex--logo .hex__edge { position:absolute; inset:0; background:var(--teal);
+  box-shadow:0 0 16px -2px rgba(46,230,182,0.7); }
+.hex--logo .hex__face { position:absolute; inset:2px; background:#0a1512; }
+.hex--logo .hex__pip { width:9px; height:10px; background:var(--teal); }
+.hex--verdict { width:66px; height:74px; }
+.hex--verdict .hex__edge { position:absolute; inset:0; background:var(--vtone);
+  box-shadow:0 0 30px -4px var(--vtone); }
+.hex--verdict .hex__face { position:absolute; inset:2px; background:#0e1a17; }
+.hex__count { font-family:var(--font-display); font-weight:900; font-size:1.75rem; color:var(--vtone); }
 
-/* verdict banner (signature) */
-.verdict { margin:1.9rem 0; background:var(--card); border:1px solid var(--line);
-  border-radius:14px; box-shadow:var(--shadow); padding:1.5rem 1.6rem; }
-.verdict__head { display:flex; align-items:center; gap:.8rem; }
-.verdict__dot { width:.9rem; height:.9rem; border-radius:50%; flex:0 0 auto; margin-top:.15rem; }
-.verdict__text { font-family:var(--font-display); font-weight:600; font-size:1.4rem;
-  letter-spacing:-.01em; line-height:1.2; color:var(--ink); }
-.verdict__sub { color:var(--muted); font-size:.9rem; margin-top:.2rem; }
-.bar { display:flex; height:.6rem; border-radius:999px; overflow:hidden;
-  margin:1.3rem 0 1.1rem; background:var(--chip); }
-.seg { display:block; height:100%; }
-.seg--ok{background:var(--ok);} .seg--skipped{background:var(--skipped);}
-.seg--issue{background:var(--issue);} .seg--errored{background:var(--errored);}
-.legend { display:flex; flex-wrap:wrap; gap:.55rem; }
-.chip { display:inline-flex; align-items:center; gap:.5rem; background:transparent;
-  border:1px solid var(--line); border-radius:999px; padding:.35rem .75rem;
-  font-family:var(--font-body); font-size:.82rem; color:var(--ink); cursor:pointer; }
-.chip:hover { border-color:var(--accent); }
-.chip.off { opacity:.4; }
-.chip .swatch { width:.6rem; height:.6rem; border-radius:2px; flex:0 0 auto; }
-.chip .swatch--ok{background:var(--ok);} .chip .swatch--skipped{background:var(--skipped);}
-.chip .swatch--issue{background:var(--issue);} .chip .swatch--errored{background:var(--errored);}
-.chip .cnt { font-family:var(--font-mono); font-weight:600; }
-.chip .lbl { color:var(--muted); }
+/* command bar */
+.cmdbar { position:sticky; top:0; z-index:20; display:flex; justify-content:space-between;
+  align-items:center; gap:20px; flex-wrap:wrap; padding:16px 30px;
+  background:rgba(10,21,18,0.82); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+  border-bottom:1px solid rgba(110,190,170,0.14); }
+.cmdbar__brandwrap { display:flex; align-items:center; gap:15px; }
+.cmdbar__id { display:flex; flex-direction:column; gap:3px; }
+.cmdbar__eyebrow { font-family:var(--font-mono); font-size:0.6rem; font-weight:500;
+  letter-spacing:0.34em; text-transform:uppercase; color:#6d827c; }
+.cmdbar__brand { font-family:var(--font-display); font-weight:900; font-size:1.32rem;
+  letter-spacing:-0.02em; line-height:1; color:var(--ink); }
+.cmdbar__cursor { color:var(--teal); }
+.cmdbar__right { display:flex; align-items:center; gap:26px; flex-wrap:wrap; }
+.cmdbar__meta { display:flex; flex-direction:column; gap:4px; text-align:right; }
+.cmdbar__meta-row { font-family:var(--font-mono); font-size:0.7rem; color:#6d827c;
+  letter-spacing:0.03em; word-break:break-all; }
+.cmdbar__meta-row span { color:#c6ded4; }
+.cmdbar__status { display:inline-flex; align-items:center; gap:8px; font-family:var(--font-mono);
+  font-size:0.66rem; letter-spacing:0.14em; text-transform:uppercase; color:var(--teal);
+  border:1px solid rgba(46,230,182,0.3); border-radius:3px; padding:6px 11px; background:rgba(46,230,182,0.07); }
+.cmdbar__status-dot { width:7px; height:7px; background:var(--teal); box-shadow:0 0 8px 0 var(--teal);
+  transform:rotate(45deg); animation:fac-blink 2s ease-in-out infinite; }
 
-/* section headings -- by name, no numbers */
-.section { display:flex; align-items:baseline; gap:.65rem; margin:2.4rem 0 1.1rem;
-  padding-bottom:.5rem; border-bottom:1px solid var(--line); }
-.section h2 { font-family:var(--font-display); font-weight:600; font-size:1.2rem;
-  letter-spacing:-.01em; margin:0; color:var(--ink); }
-.section .count { font-family:var(--font-mono); font-size:.8rem; color:var(--muted); }
-.empty { color:var(--muted); font-style:italic; margin:.5rem 0 0; }
+/* verdict / HUD panel */
+.verdict { position:relative; margin-bottom:20px; border:1px solid rgba(110,190,170,0.16);
+  border-radius:6px; padding:30px 32px; overflow:hidden;
+  background:linear-gradient(180deg, rgba(19,36,32,0.9), rgba(13,26,23,0.9)); }
+.vc { position:absolute; width:16px; height:16px; }
+.vc--tl { left:12px; top:12px; border-left:1px solid var(--vtone); border-top:1px solid var(--vtone); }
+.vc--tr { right:12px; top:12px; border-right:1px solid var(--vtone); border-top:1px solid var(--vtone); }
+.vc--bl { left:12px; bottom:12px; border-left:1px solid var(--vtone); border-bottom:1px solid var(--vtone); }
+.vc--br { right:12px; bottom:12px; border-right:1px solid var(--vtone); border-bottom:1px solid var(--vtone); }
+.verdict__head { display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+.verdict__body { flex:1 1 260px; min-width:230px; }
+.verdict__eyebrow { font-family:var(--font-mono); font-size:0.62rem; letter-spacing:0.3em;
+  text-transform:uppercase; color:#6d827c; margin-bottom:8px; }
+.verdict__headline { font-family:var(--font-display); font-weight:700; font-size:1.85rem;
+  letter-spacing:-0.015em; line-height:1.1; color:var(--ink); text-transform:uppercase; }
+.verdict__sub { margin-top:8px; font-family:var(--font-mono); font-size:0.76rem;
+  color:#8aa39c; letter-spacing:0.02em; }
+.bar { display:flex; height:8px; border-radius:2px; overflow:hidden; margin:24px 0 15px;
+  background:rgba(110,190,170,0.1); }
+.seg { display:block; height:100%; transform-origin:left;
+  animation:fac-grow .85s cubic-bezier(0.16,1,0.3,1) both; }
+.seg--ok { background:#34e0a0; box-shadow:0 0 10px -1px #34e0a0; }
+.seg--issue { background:#ff6a8a; box-shadow:0 0 10px -1px #ff6a8a; }
+.seg--errored { background:#ffcf5c; box-shadow:0 0 10px -1px #ffcf5c; }
+.seg--skipped { background:#6d8380; box-shadow:0 0 10px -1px #6d8380; }
+.legend { display:flex; flex-wrap:wrap; gap:9px; }
+.chip { display:inline-flex; align-items:center; gap:9px; background:rgba(110,190,170,0.05);
+  border:1px solid rgba(110,190,170,0.16); border-radius:3px; padding:7px 13px; cursor:pointer;
+  opacity:1; transition:opacity .18s; font-family:var(--font-mono); }
+.chip.off { opacity:.36; }
+.chip__swatch { width:8px; height:8px; transform:rotate(45deg); flex:none; }
+.chip__cnt { font-weight:700; font-size:0.8rem; color:var(--ink); }
+.chip__lbl { font-size:0.62rem; letter-spacing:0.16em; text-transform:uppercase; color:#8aa39c; }
+.sw--ok { background:#34e0a0; box-shadow:0 0 8px -1px #34e0a0; }
+.sw--issue { background:#ff6a8a; box-shadow:0 0 8px -1px #ff6a8a; }
+.sw--errored { background:#ffcf5c; box-shadow:0 0 8px -1px #ffcf5c; }
+.sw--skipped { background:#6d8380; box-shadow:0 0 8px -1px #6d8380; }
 
-/* finding cards */
-.card { position:relative; background:var(--card); border:1px solid var(--line);
-  border-radius:12px; box-shadow:var(--shadow); overflow:hidden;
-  padding:1.05rem 1.25rem 1.05rem 1.4rem; margin-bottom:.85rem; }
-.card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; }
-.card--ok::before{background:var(--ok);} .card--skipped::before{background:var(--skipped);}
-.card--issue::before{background:var(--issue);} .card--errored::before{background:var(--errored);}
-.card__head { display:flex; align-items:center; gap:.7rem; flex-wrap:wrap; }
-.card__num { font-family:var(--font-mono); font-size:.76rem; font-weight:600;
-  color:var(--chip-ink); background:var(--chip); border-radius:6px; padding:.15rem .45rem; }
-.card__title { font-family:var(--font-body); font-weight:600; font-size:1rem;
-  margin:0; flex:1 1 auto; color:var(--ink); }
-.badge { display:inline-flex; align-items:center; gap:.4rem; font-family:var(--font-body);
-  font-size:.72rem; font-weight:600; letter-spacing:.03em; text-transform:uppercase;
-  border-radius:999px; padding:.24rem .6rem; }
-.badge .bdot { width:.5rem; height:.5rem; border-radius:50%; background:currentColor; }
-.badge--ok{color:var(--ok); background:var(--ok-soft);}
-.badge--skipped{color:var(--skipped); background:var(--skipped-soft);}
-.badge--issue{color:var(--issue); background:var(--issue-soft);}
-.badge--errored{color:var(--errored); background:var(--errored-soft);}
-.card__details { margin:.65rem 0 0; white-space:pre-wrap; color:var(--ink); }
-.card__meta { margin:.55rem 0 0; font-family:var(--font-mono); font-size:.78rem; color:var(--muted); }
-.card__excerpt { margin-top:.75rem; }
-.excerpt__label { font-size:.72rem; color:var(--muted); margin-bottom:.35rem;
-  text-transform:uppercase; letter-spacing:.06em; }
-.card__excerpt pre { margin:0; padding:.75rem .85rem; background:var(--canvas);
-  border:1px solid var(--line); border-radius:8px; font-family:var(--font-mono);
-  font-size:.8rem; line-height:1.5; color:var(--ink); overflow-x:auto; white-space:pre; }
+/* telemetry strip */
+.telem { display:grid; grid-template-columns:repeat(4,1fr); gap:11px; margin-bottom:38px; }
+.stat { position:relative; border:1px solid rgba(110,190,170,0.13); border-radius:5px;
+  padding:15px 18px; overflow:hidden; background:linear-gradient(180deg,#132420,#0e1a17); }
+.stat::before { content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:var(--c); }
+.stat__val { font-family:var(--font-display); font-weight:900; font-size:2rem; line-height:1; color:var(--c); }
+.stat__lbl { margin-top:8px; font-family:var(--font-mono); font-size:0.6rem; letter-spacing:0.2em;
+  text-transform:uppercase; color:#8aa39c; }
+.stat--total { --c:#e4f1ec; } .stat--issue { --c:#ff6a8a; }
+.stat--skipped { --c:#6d8380; } .stat--ok { --c:#34e0a0; }
+
+/* section headings */
+.section { display:flex; align-items:center; gap:14px; margin:0 0 18px; }
+.section__num { font-family:var(--font-mono); font-size:0.72rem; font-weight:700;
+  letter-spacing:0.1em; color:var(--teal); }
+.section__name { margin:0; font-family:var(--font-display); font-weight:700; font-size:1.05rem;
+  letter-spacing:0.02em; text-transform:uppercase; color:var(--ink); }
+.section__rule { flex:1; height:1px; background:linear-gradient(90deg, rgba(110,190,170,0.28), transparent); }
+.section__count { font-family:var(--font-mono); font-size:0.7rem; color:#6d827c; }
+.cards { display:flex; flex-direction:column; gap:14px; margin-bottom:42px; }
+.cards__empty { display:none; margin:0; font-family:var(--font-mono); font-size:0.8rem; color:#6d827c; }
+
+/* check cards */
+.card { position:relative; overflow:hidden; border-radius:5px;
+  background:linear-gradient(180deg,#132420,#0e1a17); border:1px solid rgba(110,190,170,0.13);
+  box-shadow:0 10px 30px -22px rgba(0,0,0,0.9); }
+.card--ok { --tone:#34e0a0; --tone-soft:rgba(52,224,160,0.11); --tone-bd:rgba(52,224,160,0.32); }
+.card--issue { --tone:#ff6a8a; --tone-soft:rgba(255,106,138,0.12); --tone-bd:rgba(255,106,138,0.34);
+  box-shadow:0 0 0 1px rgba(255,106,138,0.14), 0 16px 40px -26px rgba(255,90,120,0.5); }
+.card--errored { --tone:#ffcf5c; --tone-soft:rgba(255,207,92,0.12); --tone-bd:rgba(255,207,92,0.32); }
+.card--skipped { --tone:#6d8380; --tone-soft:rgba(109,131,128,0.10); --tone-bd:rgba(109,131,128,0.28); }
+.card__bar { position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--tone);
+  box-shadow:0 0 14px -1px var(--tone); }
+.card__corner { position:absolute; width:9px; height:9px; }
+.card__corner--tl { left:11px; top:9px; border-left:1px solid var(--tone-bd); border-top:1px solid var(--tone-bd); }
+.card__corner--br { right:11px; bottom:9px; border-right:1px solid rgba(110,190,170,0.2);
+  border-bottom:1px solid rgba(110,190,170,0.2); }
+.card__pad { padding:19px 24px 19px 26px; }
+.card__head { display:flex; align-items:center; gap:13px; flex-wrap:wrap; }
+.card__num { font-family:var(--font-mono); font-size:11.5px; font-weight:700; letter-spacing:0.08em;
+  color:var(--tone); background:var(--tone-soft); border:1px solid var(--tone-bd); border-radius:3px;
+  padding:3px 8px; text-transform:uppercase; }
+.card__title { margin:0; flex:1 1 auto; font-family:var(--font-display); font-weight:600;
+  font-size:1.04rem; letter-spacing:-0.005em; color:var(--ink); }
+.card__badge { display:inline-flex; align-items:center; gap:8px; font-family:var(--font-mono);
+  font-size:0.68rem; font-weight:700; letter-spacing:0.16em; text-transform:uppercase; color:var(--tone);
+  background:var(--tone-soft); border:1px solid var(--tone-bd); border-radius:3px; padding:5px 10px; }
+.card__badge-dot { width:7px; height:7px; background:var(--tone); box-shadow:0 0 8px 0 var(--tone);
+  transform:rotate(45deg); }
+.card__details { margin:14px 0 0; font-family:var(--font-body); font-size:0.94rem; line-height:1.58;
+  color:#c6ded4; text-wrap:pretty; }
+.card__meta { margin-top:12px; display:inline-flex; align-items:center; gap:8px; font-family:var(--font-mono);
+  font-size:0.7rem; letter-spacing:0.06em; color:#6d827c; }
+.card__meta-arrow { color:var(--tone); }
+.excerpt { margin-top:16px; border-radius:5px; overflow:hidden; border:1px solid rgba(110,190,170,0.16);
+  background:#081311; }
+.excerpt__head { display:flex; align-items:center; gap:9px; padding:8px 13px;
+  border-bottom:1px solid rgba(110,190,170,0.13); background:rgba(110,190,170,0.05); }
+.excerpt__dot { width:8px; height:8px; background:var(--tone); transform:rotate(45deg); flex:none; }
+.excerpt__label { font-family:var(--font-mono); font-size:11px; font-weight:500; letter-spacing:0.05em; color:#a9c4bb; }
+.excerpt__tag { margin-left:auto; font-family:var(--font-mono); font-size:9.5px; letter-spacing:0.22em;
+  color:#5f746e; text-transform:uppercase; }
+.excerpt__body { margin:0; padding:13px 16px; font-family:var(--font-mono); font-size:12.5px;
+  line-height:1.65; color:#9fe4cf; overflow-x:auto; white-space:pre; }
 
 /* footer */
-.foot { margin-top:2.5rem; padding-top:1rem; border-top:1px solid var(--line);
-  color:var(--muted); font-size:.78rem; font-family:var(--font-mono); }
-
-/* status colour helpers */
-.vd--ok{background:var(--ok);} .vd--skipped{background:var(--skipped);}
-.vd--issue{background:var(--issue);} .vd--errored{background:var(--errored);}
+.foot { margin-top:54px; padding-top:18px; border-top:1px solid rgba(110,190,170,0.14);
+  display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; font-family:var(--font-mono);
+  font-size:0.7rem; color:#5f746e; letter-spacing:0.04em; }
 
 /* status filtering: hiding a status adds a body class */
 body.hide-OK .card[data-status="OK"],
@@ -1681,168 +1748,194 @@ body.hide-SKIPPED .card[data-status="SKIPPED"],
 body.hide-ISSUE .card[data-status="ISSUE"],
 body.hide-ERRORED .card[data-status="ERRORED"] { display:none; }
 
-/* focus + motion */
-button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-@media (prefers-reduced-motion: no-preference) {
-  .seg { animation:grow .7s ease-out both; transform-origin:left; }
-}
-@keyframes grow { from { transform:scaleX(0); } to { transform:scaleX(1); } }
+/* motion */
+@keyframes fac-grow { from { transform:scaleX(0); } to { transform:scaleX(1); } }
+@keyframes fac-blink { 0%,100% { opacity:.35; } 50% { opacity:1; } }
+button:focus-visible { outline:2px solid var(--teal); outline-offset:2px; }
+@media (prefers-reduced-motion: reduce) { * { animation:none !important; } }
 
 /* responsive */
-@media (max-width:560px) {
-  .wrap { padding:1.6rem 1.1rem; }
-  .masthead { flex-direction:column; }
-  .meta-block { align-items:flex-start; text-align:left; }
+@media (max-width:640px) {
+  .cmdbar { padding:14px 18px; }
+  .wrap { padding:26px 18px 70px; }
+  .telem { grid-template-columns:repeat(2,1fr); }
+  .cmdbar__meta { text-align:left; }
 }
 """
 
-# Runs before paint (in <head>) to set the colour mode with no flash: honours a
-# saved choice, else the OS preference.
-_HTML_MODE_BOOT = """\
-(function () {
-  try {
-    var m = localStorage.getItem("faclog-mode");
-    if (!m) m = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-    document.documentElement.setAttribute("data-mode", m);
-  } catch (e) {
-    document.documentElement.setAttribute("data-mode", "light");
-  }
-})();
-"""
-
-# Inline script (end of <body>): light/dark toggle (persisted) + status filters.
+# Inline script (end of <body>): status-filter toggles. Clicking a legend chip
+# hides that status' cards (via a body class) and dims the chip; each section then
+# shows a "no checks match" line when the active filter empties it.
 _HTML_SCRIPT = """\
 (function () {
-  var root = document.documentElement, body = document.body;
-  var toggle = document.getElementById("mode-toggle");
-  var label = document.getElementById("mode-label");
-  function syncLabel() {
-    var dark = root.getAttribute("data-mode") === "dark";
-    if (label) label.textContent = dark ? "Light mode" : "Dark mode";
+  var body = document.body;
+  function refresh() {
+    var groups = document.querySelectorAll(".cards");
+    for (var i = 0; i < groups.length; i++) {
+      var cards = groups[i].querySelectorAll(".card");
+      var visible = 0;
+      for (var j = 0; j < cards.length; j++) {
+        if (cards[j].offsetParent !== null) visible++;
+      }
+      var empty = groups[i].querySelector(".cards__empty");
+      if (empty) empty.style.display = visible ? "none" : "block";
+    }
   }
-  syncLabel();
-  if (toggle) {
-    toggle.addEventListener("click", function () {
-      var next = root.getAttribute("data-mode") === "dark" ? "light" : "dark";
-      root.setAttribute("data-mode", next);
-      try { localStorage.setItem("faclog-mode", next); } catch (e) {}
-      syncLabel();
+  var chips = document.querySelectorAll(".chip[data-filter]");
+  for (var k = 0; k < chips.length; k++) {
+    chips[k].addEventListener("click", function () {
+      var hidden = body.classList.toggle("hide-" + this.getAttribute("data-filter"));
+      this.classList.toggle("off", hidden);
+      this.setAttribute("aria-pressed", (!hidden).toString());
+      refresh();
     });
   }
-  document.querySelectorAll(".chip[data-filter]").forEach(function (b) {
-    b.addEventListener("click", function () {
-      var hidden = body.classList.toggle("hide-" + b.getAttribute("data-filter"));
-      b.classList.toggle("off", hidden);
-      b.setAttribute("aria-pressed", (!hidden).toString());
-    });
-  });
+  refresh();
 })();
 """
 
 
-def _verdict(counts: Counter) -> tuple[str, str, str]:
-    """Derive (status-class, plain-language headline, sub-line) from the counts."""
+def _verdict(counts: Counter) -> tuple[str, str, int]:
+    """Derive (headline, tone-hex, count) for the HUD verdict badge from the counts.
+
+    Mirrors the design component: issues dominate, then unrunnable checks, else a
+    nominal all-clear. Only Sections 1-2 feed this (see ``render_report_html``)."""
     n_issue = counts.get(Status.ISSUE, 0)
     n_err = counts.get(Status.ERRORED, 0)
-    total = sum(counts.values())
     if n_issue:
-        verb = "needs" if n_issue == 1 else "need"
-        noun = "issue" if n_issue == 1 else "issues"
-        headline = f"{n_issue} {noun} {verb} attention"
-        cls = "issue"
-    elif n_err:
-        noun = "check" if n_err == 1 else "checks"
-        headline = f"{n_err} {noun} couldn't run"
-        cls = "errored"
-    else:
-        headline = "All clear — no issues found"
-        cls = "ok"
-    plural = "check" if total == 1 else "checks"
-    sub = f"{total} {plural} run against this bundle"
-    return cls, headline, sub
+        headline = "One issue needs attention" if n_issue == 1 else f"{n_issue} issues need attention"
+        return headline, "#ff6a8a", n_issue
+    if n_err:
+        headline = "One check could not run" if n_err == 1 else f"{n_err} checks could not run"
+        return headline, "#ffcf5c", n_err
+    return "All systems nominal", "#34e0a0", 0
 
 
 def render_report_html(results: list[tuple[Check, CheckResult]], bundle_dir: str) -> str:
-    """Render all results as one self-contained HTML page (the "diagnostic dossier")."""
+    """Render all results as one self-contained HTML page (the terminal "HUD" dossier)."""
     counts = Counter(res.status for _, res in results)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    total = sum(counts.values()) or 1  # avoid divide-by-zero for the proportional bar
+    total = sum(counts.values())
+    bar_total = total or 1  # avoid divide-by-zero for the proportional bar
 
-    # Headline reflects the deterministic Checks 1-11 / Info 1-5 only, so a broad
+    # Verdict reflects the deterministic Checks 1-11 / Info 1-5 only, so a broad
     # heuristic A1/A3 finding (section 3) never flips an otherwise-clean bundle to
-    # "needs attention". The bar/legend below still count all cards on the page.
+    # "needs attention". The bar/legend/telemetry below still count all cards.
     verdict_counts = Counter(res.status for chk, res in results if chk.section in (1, 2))
-    vcls, headline, sub = _verdict(verdict_counts)
+    headline, vtone, vcount = _verdict(verdict_counts)
+    sub = (f"{total} CHECKS RUN &middot; {counts.get(Status.OK, 0)} PASS &middot; "
+           f"{counts.get(Status.ISSUE, 0)} FLAG &middot; {counts.get(Status.SKIPPED, 0)} SKIP")
 
-    order = (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
+    seg_order = (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
     segments = "".join(
-        f'<span class="seg seg--{_status_class(st)}" style="width:{counts[st] / total * 100:.4f}%"></span>'
-        for st in order if counts.get(st, 0)
+        f'<span class="seg seg--{_status_class(st)}" style="width:{counts[st] / bar_total * 100:.4f}%"></span>'
+        for st in seg_order if counts.get(st, 0)
     )
+    legend_order = (Status.OK, Status.ISSUE, Status.SKIPPED, Status.ERRORED)
     legend = "\n".join(
-        f'<button class="chip" type="button" data-filter="{st}" aria-pressed="true">'
-        f'<span class="swatch swatch--{_status_class(st)}"></span>'
-        f'<span class="cnt">{counts.get(st, 0)}</span>'
-        f'<span class="lbl">{st.lower()}</span></button>'
-        for st in order
+        f'    <button class="chip" type="button" data-filter="{st}" aria-pressed="true">'
+        f'<span class="chip__swatch sw--{_status_class(st)}"></span>'
+        f'<span class="chip__cnt">{counts.get(st, 0)}</span>'
+        f'<span class="chip__lbl">{st.lower()}</span></button>'
+        for st in legend_order
     )
 
-    def section_html(num: int, name: str) -> str:
+    stats = (
+        ("total", "checks run", total),
+        ("issue", "issues", counts.get(Status.ISSUE, 0)),
+        ("skipped", "skipped", counts.get(Status.SKIPPED, 0)),
+        ("ok", "clean", counts.get(Status.OK, 0)),
+    )
+    telem = "\n".join(
+        f'    <div class="stat stat--{key}"><div class="stat__val">{val}</div>'
+        f'<div class="stat__lbl">{lbl}</div></div>'
+        for key, lbl, val in stats
+    )
+
+    def section_html(num: int, idx: str, name: str) -> str:
         blocks = [_html_block(res) for chk, res in results if chk.section == num]
-        body = "\n".join(blocks) if blocks else '<p class="empty">No checks in this section.</p>'
+        cards = "\n".join(blocks)
+        empty = '<p class="cards__empty">// no checks match the current filter</p>'
+        body = f"{cards}\n{empty}" if cards else empty
         return (
-            f'<div class="section"><h2>{_esc(name)}</h2>'
-            f'<span class="count">{len(blocks)}</span></div>\n{body}'
+            f'    <div class="section"><span class="section__num">{idx}</span>'
+            f'<h2 class="section__name">{_esc(name)}</h2>'
+            f'<span class="section__rule"></span>'
+            f'<span class="section__count">{len(blocks)} checks</span></div>\n'
+            f'    <div class="cards">\n{body}\n    </div>'
         )
 
     return f"""<!DOCTYPE html>
-<html lang="en" data-mode="light">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>faclog &middot; FortiAuthenticator diagnostic report</title>
+<title>faclog &middot; FortiAuthenticator log review</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;500;600;700;900&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 {_HTML_STYLE}</style>
-<script>{_HTML_MODE_BOOT}</script>
 </head>
 <body>
-<div class="wrap">
-<header class="masthead">
-  <div class="brand-block">
-    <div class="brand">faclog<span class="dot">.</span></div>
-    <div class="tagline">FortiAuthenticator diagnostic report</div>
-  </div>
-  <div class="meta-block">
-    <div class="meta-row">bundle <b>{_esc(bundle_dir)}</b></div>
-    <div class="meta-row">generated <b>{_esc(generated)}</b></div>
-    <button class="mode-toggle" id="mode-toggle" type="button" aria-label="Toggle colour theme">
-      <span id="mode-label">Dark mode</span>
-    </button>
-  </div>
-</header>
+<div class="page">
+  <div class="page__glow"></div>
 
-<section class="verdict">
-  <div class="verdict__head">
-    <span class="verdict__dot vd--{vcls}"></span>
-    <div>
-      <div class="verdict__text">{_esc(headline)}</div>
-      <div class="verdict__sub">{_esc(sub)}</div>
+  <header class="cmdbar">
+    <div class="cmdbar__brandwrap">
+      <div class="hex hex--logo">
+        <div class="hex__edge clip-hex"></div>
+        <div class="hex__face clip-hex"></div>
+        <div class="hex__core"><span class="hex__pip clip-hex"></span></div>
+      </div>
+      <div class="cmdbar__id">
+        <span class="cmdbar__eyebrow">FortiAuthenticator &middot; Log Review</span>
+        <span class="cmdbar__brand">faclog<span class="cmdbar__cursor">_</span></span>
+      </div>
     </div>
-  </div>
-  <div class="bar">{segments}</div>
-  <div class="legend">
+    <div class="cmdbar__right">
+      <div class="cmdbar__meta">
+        <div class="cmdbar__meta-row">BUNDLE <span>{_esc(bundle_dir)}</span></div>
+        <div class="cmdbar__meta-row">GENERATED <span>{_esc(generated)}</span></div>
+      </div>
+      <div class="cmdbar__status"><span class="cmdbar__status-dot"></span>scan complete</div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <section class="verdict" style="--vtone:{vtone}">
+      <span class="vc vc--tl"></span><span class="vc vc--tr"></span><span class="vc vc--bl"></span><span class="vc vc--br"></span>
+      <div class="verdict__head">
+        <div class="hex hex--verdict">
+          <div class="hex__edge clip-hex"></div>
+          <div class="hex__face clip-hex"></div>
+          <div class="hex__core"><span class="hex__count">{vcount}</span></div>
+        </div>
+        <div class="verdict__body">
+          <div class="verdict__eyebrow">Diagnostic Verdict</div>
+          <div class="verdict__headline">{_esc(headline)}</div>
+          <div class="verdict__sub">{sub}</div>
+        </div>
+      </div>
+      <div class="bar">{segments}</div>
+      <div class="legend">
 {legend}
+      </div>
+    </section>
+
+    <div class="telem">
+{telem}
+    </div>
+
+{section_html(1, "01", "Issues Found")}
+{section_html(2, "02", "General Information")}
+{section_html(3, "03", "Other Abnormalities")}
+
+    <footer class="foot">
+      <span>faclog &middot; FortiAuthenticator log analyzer</span>
+      <span>{_esc(generated)}</span>
+    </footer>
   </div>
-</section>
-
-{section_html(1, "Issues Found")}
-{section_html(2, "General Information")}
-{section_html(3, "Other Abnormalities")}
-
-<footer class="foot">faclog &middot; generated {_esc(generated)}</footer>
 </div>
 <script>
 {_HTML_SCRIPT}</script>

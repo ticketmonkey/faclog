@@ -39,8 +39,8 @@ python3 faclog.py /path/to/bundle -o report.txt
 # Also run the live reachability probe (Check 6)
 python3 faclog.py /path/to/bundle --check-network
 
-# Render a self-contained HTML report (open in any browser; professional
-# "diagnostic dossier" look with a light/dark toggle and status filters)
+# Render a self-contained HTML report (open in any browser; dark terminal
+# "HUD" look with a verdict panel, telemetry strip, and status filters)
 python3 faclog.py /path/to/bundle -o report.html
 python3 faclog.py /path/to/bundle --html > report.html
 ```
