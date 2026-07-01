@@ -66,10 +66,11 @@ suffixes (`access_log`, `access_log.1`, …) are picked up automatically.
 
 ## Output
 
-A plain-text report (or a self-contained HTML page with `--html`) with two named sections:
+A plain-text report (or a self-contained HTML page with `--html`) with three named sections:
 
 - **Issues Found**: Checks `1, 2a, 2b, 3, 4a, 4b, 5, 6, 7, 8, 9, 10, 11`.
 - **General Information**: `Info 1`–`Info 5`.
+- **Other Abnormalities**: `A1`–`A3` (heuristic, catch-all analyses).
 
 Every check always emits one of four results, and the numbering is fixed (it never drifts when
 checks are skipped):
@@ -101,6 +102,17 @@ checks are skipped):
 
 - Info 1: CPU cores · Info 2: Memory · Info 3: Resource-spec compliance ·
   Info 4: HA operation · Info 5: Top recurring log lines
+
+**Section 3 — other abnormalities**
+
+Heuristic, catch-all analyses that surface anomalies *beyond* the specific checks above:
+
+- A1: Elevated log severity sweep — ranks recurring error/critical/panic signatures across
+  all message logs, excluding events already itemized by Checks 1–11.
+- A2: Log coverage & timespan — which bundle files were present, their line counts, and the
+  earliest→latest timestamp span of each (grounds what was actually analyzed).
+- A3: Auth & HTTP breakdown — Forti authentication-failure reasons (beyond the `2a`
+  brute-force burst) and the Apache `access_log` HTTP status distribution (4xx/5xx).
 
 ## Notes
 

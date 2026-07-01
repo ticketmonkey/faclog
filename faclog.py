@@ -80,6 +80,33 @@ LDAP_TOP_OUTAGES = 10
 #: Info 5 -- number of most-frequent normalized log lines to show.
 INFO_TOP_RECURRING = 10
 
+# --- Section 3 "Other Abnormalities" (A1-A3): heuristic analyses beyond the -------
+#     specific Checks 1-11. All tunables live here like every other threshold.
+
+#: A1 -- Forti ``level=`` values treated as elevated severity.
+SEVERITY_LEVELS = ("error", "critical", "emergency", "alert", "panic")
+
+#: A1 -- non-Forti log files swept for severity keywords (Forti events are always swept).
+SEVERITY_SWEEP_FILES = ("fgdfac.log", "wad.log", "error_log", "kern.log", "syslog")
+
+#: A1 -- number of top recurring severe signatures to list.
+SEVERITY_TOP_SIGNATURES = 10
+
+#: A1 -- a single normalized signature recurring at least this many times is flagged ISSUE.
+SEVERITY_SIGNATURE_ISSUE_COUNT = 10
+
+#: A2 -- the canonical bundle file inventory, for the coverage/timespan summary.
+BUNDLE_FILE_INVENTORY = (
+    "fac.logs", "gui-db.log", "access_log", "error_log", "fgdfac.log",
+    "kern.log", "syslog", "wad.log", "disk_usage", "curproc", "meminfo", "fwinfo",
+)
+
+#: A3 -- number of top auth-failure reasons to list.
+AUTH_FAIL_TOP = 10
+
+#: A3 -- total Apache 5xx responses at/above which the breakdown is flagged ISSUE.
+HTTP_5XX_ISSUE_COUNT = 25
+
 # Info 3 -- resource sizing tables, encoded as data (not inline conditionals).
 # Each row: (max_users_upper_bound, required_cpus, required_ram_gb, required_disk_tb).
 # Rows are ordered ascending; a licensed "Max users" count maps to the first row whose
@@ -1227,6 +1254,203 @@ def info_5(ctx: Context) -> CheckResult:
 
 
 # ---------------------------------------------------------------------------
+# (5c) Section 3 -- "Other Abnormalities" (A1-A3).
+#
+# Heuristic, catch-all analyses that surface anomalies *beyond* the specific
+# Checks 1-11: a general severity sweep, a coverage/timespan summary, and an
+# auth/HTTP breakdown. Each reuses the normalization layer, BundleReader, and
+# Occurrences, and each still always emits OK/SKIPPED/ISSUE/ERRORED.
+# ---------------------------------------------------------------------------
+
+# A1 severity keyword (word-boundary) -- covers Apache [error], kernel, wad, fgdfac,
+# and Forti "level=error" lines (the level value is caught by the same word match).
+_SEVERITY_RE = re.compile(
+    r"\b(?:error|critical|crit|panic|fatal|emerg(?:ency)?|alert|fail(?:ed|ure)?)\b", re.I)
+
+# Lines a specific check already owns are excluded from the A1 sweep so it never
+# double-counts. These reuse the exact predicates those checks use, so A1 stays in sync.
+_A1_CLAIMED_RE = (_REBOOT_RE, _NTPD_RE, _SEGFAULT_RE, _WAD_HTTP_RE)
+_A1_CLAIMED_SUB = ("oom-kill", "out of memory", "invalid user")
+
+
+def _a1_is_severe(line: str) -> bool:
+    """True if the line's Forti ``level=`` is elevated or it hits the severity regex."""
+    if "level=" in line:
+        level = _forti_fields(line).get("level")
+        if level and level.lower() in SEVERITY_LEVELS:
+            return True
+    return bool(_SEVERITY_RE.search(line))
+
+
+def _a1_claimed(line: str) -> bool:
+    """True if a specific check (2a/3/4a/7/8/9/11) already itemizes this line."""
+    low = line.lower()
+    if any(sub in low for sub in _A1_CLAIMED_SUB):
+        return True
+    if "EXT4-fs" in line and "error" in low:  # check_11's own guard
+        return True
+    return any(rgx.search(line) for rgx in _A1_CLAIMED_RE)
+
+
+@register("A1", "Elevated log severity sweep", section=3)
+def check_a1(ctx: Context) -> CheckResult:
+    """Sweep all message logs for elevated-severity lines, excluding those a specific
+    check already owns, and rank the recurring signatures (via _normalize_logline)."""
+    title = "Elevated log severity sweep"
+    sources = list(_FORTI_EVENT) + list(SEVERITY_SWEEP_FILES)
+    if not ctx.reader.present(*sources):
+        return skipped("A1", title)
+    lines = list(_forti_lines(ctx.reader))
+    for name in SEVERITY_SWEEP_FILES:
+        lines.extend(ctx.reader.read_lines(name))
+    counter: Counter = Counter()
+    per_sig: dict = defaultdict(lambda: Occurrences(keep=1))
+    scanned = 0
+    for line in lines:
+        if not line.strip() or not _a1_is_severe(line) or _a1_claimed(line):
+            continue
+        sig = _normalize_logline(line)
+        if not sig:
+            continue
+        scanned += 1
+        counter[sig] += 1
+        per_sig[sig].add(parse_timestamp(line), line.strip())
+    if not counter:
+        return ok("A1", title, details="no unclaimed elevated-severity lines found")
+    top = counter.most_common(SEVERITY_TOP_SIGNATURES)
+    block = "\n".join(f"{c:>6}  {sig[:120]}" for sig, c in top)
+    label = f"Top {len(top)} recurring severe signatures:"
+    details = (f"{scanned} elevated-severity line(s) across {len(counter)} distinct "
+               f"signature(s), excluding events already itemized by Checks 1-11")
+    top_sig, top_count = top[0]
+    if top_count >= SEVERITY_SIGNATURE_ISSUE_COUNT:
+        return issue("A1", title,
+                     details=details + f"; top signature recurs x{top_count} "
+                             f"(>= {SEVERITY_SIGNATURE_ISSUE_COUNT})",
+                     timestamp=per_sig[top_sig].latest_timestamp,
+                     excerpt=block, excerpt_label=label)
+    return CheckResult("A1", title, Status.OK, details=details,
+                       excerpt=block, excerpt_label=label)
+
+
+@register("A2", "Log coverage & timespan", section=3)
+def check_a2(ctx: Context) -> CheckResult:
+    """Summarize what was analyzed: which bundle files are present, their line counts,
+    and each file's earliest -> latest timestamp span. Always informational."""
+    title = "Log coverage & timespan"
+    present_rows = []  # (name, line_count, min_ts, max_ts)
+    absent = []
+    all_min = all_max = None
+    for name in BUNDLE_FILE_INVENTORY:
+        if not ctx.reader.find(name):
+            absent.append(name)
+            continue
+        lines = ctx.reader.read_lines(name)
+        times = [t for t in (parse_timestamp(l) for l in lines) if t is not None]
+        lo = min(times) if times else None
+        hi = max(times) if times else None
+        if lo is not None:
+            all_min = lo if all_min is None else min(all_min, lo)
+            all_max = hi if all_max is None else max(all_max, hi)
+        present_rows.append((name, len(lines), lo, hi))
+    width = max((len(n) for n, *_ in present_rows), default=0)
+    out = []
+    for name, count, lo, hi in present_rows:
+        span = (f"{to_display(lo)} -> {to_display(hi)}" if lo is not None
+                else "(no parseable timestamps)")
+        out.append(f"present  {name:<{width}}  {count:>7} lines   {span}")
+    if absent:
+        out.append("")
+        out.append("absent:  " + ", ".join(absent))
+    span_note = (f"; overall span {to_display(all_min)} -> {to_display(all_max)}"
+                 if all_min is not None else "")
+    details = (f"{len(present_rows)} of {len(BUNDLE_FILE_INVENTORY)} expected bundle "
+               f"files present{span_note}")
+    return CheckResult("A2", title, Status.OK, details=details,
+                       excerpt="\n".join(out) if out else "(no bundle files found)",
+                       excerpt_label="Coverage:")
+
+
+# A3: pull the HTTP status token that follows the quoted Apache request line.
+_A3_ACCESS_STATUS_RE = re.compile(r'"[A-Z]+[^"]*"\s+(\d{3})\b')
+# A3: an authentication line counts as a failure if it carries one of these words.
+_A3_AUTH_FAIL_RE = re.compile(
+    r"\b(?:fail(?:ed|ure)?|denied|reject(?:ed)?|lockout|locked|expired)\b", re.I)
+
+
+@register("A3", "Auth & HTTP breakdown", section=3)
+def check_a3(ctx: Context) -> CheckResult:
+    """Two heuristic breakdowns: Forti authentication-failure reasons (beyond the 2a
+    brute-force burst) and the Apache access_log HTTP status distribution."""
+    title = "Auth & HTTP breakdown"
+    have_forti = ctx.reader.present(*_FORTI_EVENT)
+    have_access = ctx.reader.present("access_log")
+    if not have_forti and not have_access:
+        return skipped("A3", title)
+
+    # Sub-A: Forti auth-failure reasons.
+    reasons: Counter = Counter()
+    auth_total = 0
+    latest_fail = Occurrences(keep=1)
+    if have_forti:
+        for line in _forti_lines(ctx.reader):
+            low = line.lower()
+            if "authentication" not in low and "login" not in low:
+                continue
+            if not _A3_AUTH_FAIL_RE.search(line):
+                continue
+            fields = _forti_fields(line)
+            raw = fields.get("msg") or fields.get("status") or fields.get("action") or ""
+            reasons[_normalize_logline(raw)[:80] or "(unspecified)"] += 1
+            auth_total += 1
+            latest_fail.add(parse_timestamp(line), line.strip())
+
+    # Sub-B: Apache HTTP status distribution.
+    codes: Counter = Counter()
+    classes: Counter = Counter()
+    if have_access:
+        for line in ctx.reader.read_lines("access_log"):
+            m = _A3_ACCESS_STATUS_RE.search(line)
+            if m:
+                code = m.group(1)
+                codes[code] += 1
+                classes[f"{code[0]}xx"] += 1
+    n_4xx = sum(c for code, c in codes.items() if code.startswith("4"))
+    n_5xx = sum(c for code, c in codes.items() if code.startswith("5"))
+
+    out = []
+    if have_forti:
+        if reasons:
+            out.append("Auth failures by reason:")
+            out.extend(f"  {c:>6}  {r}" for r, c in reasons.most_common(AUTH_FAIL_TOP))
+        else:
+            out.append("Auth failures by reason: none found")
+    else:
+        out.append("Auth failures by reason: (fac.logs/gui-db.log not present)")
+    out.append("")
+    if have_access:
+        if codes:
+            out.append("HTTP status distribution:")
+            out.extend(f"  {c:>6}  {cls}" for cls, c in sorted(classes.items()))
+            out.append("  top codes: " + ", ".join(
+                f"{code} x{c}" for code, c in codes.most_common(AUTH_FAIL_TOP)))
+        else:
+            out.append("HTTP status distribution: no status codes parsed")
+    else:
+        out.append("HTTP status distribution: (access_log not present)")
+
+    details = (f"{auth_total} auth failure(s)"
+               + (f" across {len(reasons)} reason(s)" if reasons else "")
+               + f"; HTTP 4xx={n_4xx}, 5xx={n_5xx}")
+    if n_5xx >= HTTP_5XX_ISSUE_COUNT:
+        return issue("A3", title,
+                     details=details + f" (5xx >= {HTTP_5XX_ISSUE_COUNT})",
+                     timestamp=None, excerpt="\n".join(out), excerpt_label="Breakdown:")
+    return CheckResult("A3", title, Status.OK, details=details,
+                       excerpt="\n".join(out), excerpt_label="Breakdown:")
+
+
+# ---------------------------------------------------------------------------
 # (4) Reporter.
 # ---------------------------------------------------------------------------
 
@@ -1284,6 +1508,7 @@ def render_report(results: list[tuple[Check, CheckResult]]) -> str:
 
     section(1, "ISSUES FOUND")
     section(2, "GENERAL INFORMATION")
+    section(3, "OTHER ABNORMALITIES")
     return "\n".join(out)
 
 
@@ -1543,7 +1768,11 @@ def render_report_html(results: list[tuple[Check, CheckResult]], bundle_dir: str
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = sum(counts.values()) or 1  # avoid divide-by-zero for the proportional bar
 
-    vcls, headline, sub = _verdict(counts)
+    # Headline reflects the deterministic Checks 1-11 / Info 1-5 only, so a broad
+    # heuristic A1/A3 finding (section 3) never flips an otherwise-clean bundle to
+    # "needs attention". The bar/legend below still count all cards on the page.
+    verdict_counts = Counter(res.status for chk, res in results if chk.section in (1, 2))
+    vcls, headline, sub = _verdict(verdict_counts)
 
     order = (Status.ISSUE, Status.ERRORED, Status.OK, Status.SKIPPED)
     segments = "".join(
@@ -1611,6 +1840,7 @@ def render_report_html(results: list[tuple[Check, CheckResult]], bundle_dir: str
 
 {section_html(1, "Issues Found")}
 {section_html(2, "General Information")}
+{section_html(3, "Other Abnormalities")}
 
 <footer class="foot">faclog &middot; generated {_esc(generated)}</footer>
 </div>

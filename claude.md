@@ -23,8 +23,9 @@ across files and even within a single check.
 - **Per-check isolation.** A malformed line or missing file in one check must never abort the
   run. `run_check()` wraps each check in try/except → `ERRORED`.
 - **Fixed numbering.** Render order is exactly `1, 2a, 2b, 3, 4a, 4b, 5, 6, 7, 8, 9, 10, 11`
-  then `Info 1–5`. Numbering must not drift when checks are skipped — it is fixed in the
-  `REGISTRY`, not derived at runtime. (This spec's numbering overrides any sample report.)
+  then `Info 1–5`, then `A1–A3` (section 3, "Other Abnormalities"). Numbering must not drift
+  when checks are skipped — it is fixed in the `REGISTRY`, not derived at runtime. (This
+  spec's numbering overrides any sample report.)
 - **All thresholds are named constants** in the constants block near the top of `faclog.py`
   (auth window, brute-force counts, disk %, clock drift, lookback days). No magic numbers
   buried in checks.
@@ -58,15 +59,20 @@ access), `error_log` (Apache error), `fgdfac.log` (Forti daemon, ISO8601 + HTTP 
 5. **Checks (Sections 5–6)** — one `@register`ed function per check/info, with detection
    logic implemented. Shared parsing helpers (`_forti_fields`, `_forti_lines`,
    `_kernel_lines`, `_cpu_core_count`, `_memory_gb`) sit alongside the checks; Info-3
-   sizing tables are encoded as data (`RESOURCE_TABLE_A`/`_B`).
-6. **Reporter** — `render_report()` emits the two banner sections.
+   sizing tables are encoded as data (`RESOURCE_TABLE_A`/`_B`). Section 3 (`A1–A3`,
+   "Other Abnormalities") holds heuristic catch-all analyses beyond the specific checks;
+   A1 reuses the individual checks' own predicates to avoid double-counting.
+6. **Reporter** — `render_report()` (text) and `render_report_html()` emit the three banner
+   sections. The HTML verdict headline is derived from sections 1+2 only, so a heuristic
+   section-3 finding never flips an otherwise-clean bundle.
 7. **CLI** — `argparse`: positional `bundle_dir`, `--check-network`, `-o/--output`.
 
 ## Status
 
 Built end-to-end: framework (spec Sections 0–4) plus detection logic for all of Checks 1–11
-and Info 1–5 (spec Sections 5–6), reusing the normalization layer, `BundleReader`, and
-`Occurrences`. Two assumptions to note: the "last 30 days" window (Checks 5, Info 5) is
+and Info 1–5 (spec Sections 5–6), plus the section-3 `A1–A3` heuristic analyses, reusing the
+normalization layer, `BundleReader`, and `Occurrences`. Two assumptions to note: the
+"last 30 days" window (Checks 5, Info 5) is
 relative to the most recent timestamp in the source (no reliable "now" on an air-gapped box),
 and Check 6 network probing stays off unless `--check-network` is passed.
 
